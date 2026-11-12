@@ -12,5 +12,4 @@ rustflags = [
     "-C", "link-arg=-Tlinker.ld",
     "-C", "link-arg=-zmax-page-size=0x1000",
     "-C", "no-redzone=y",
-    "-C", "target-feature=-mmx,-sse,-sse2,+soft-float",
 ]
