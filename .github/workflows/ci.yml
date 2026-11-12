@@ -93,7 +93,6 @@ jobs:
             -display none \
             -serial stdio \
             -no-reboot \
-            -no-shutdown \
             -device isa-debug-exit,iobase=0xf4,iosize=0x04
           EXIT_CODE=$?
           set -e
