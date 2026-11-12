@@ -138,7 +138,7 @@ pub mod ostd {
         pub fn init() {
             outb(Self::COM1 + 1, 0x00); // Tắt mọi ngắt UART
             outb(Self::COM1 + 3, 0x80); // Bật DLAB (đặt tốc độ baud)
-            outb(Self::COM1 + 0, 0x03); // Chia tần số: 38400 baud (byte thấp)
+            outb(Self::COM1, 0x03); // Chia tần số: 38400 baud (byte thấp)
             outb(Self::COM1 + 1, 0x00); // Byte cao
             outb(Self::COM1 + 3, 0x03); // 8 bits, không parity, 1 stop bit
             outb(Self::COM1 + 2, 0xC7); // Bật FIFO, xóa bộ đệm, ngưỡng 14-byte
@@ -462,9 +462,7 @@ pub mod ostd {
 
     impl BitmapFrameAllocator {
         pub fn new() -> Self {
-            // SAFETY:
-            // Lấy địa chỉ gốc của vùng `STATIC_FRAME_POOL` đã căn lề 4096-byte.
-            let base_addr = unsafe { &raw const STATIC_FRAME_POOL as u64 };
+            let base_addr = &raw const STATIC_FRAME_POOL as u64;
             Self {
                 bitmap: [0; 4],
                 base_addr,
