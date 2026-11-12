@@ -1451,7 +1451,7 @@ pub mod linux_abi {
         elf[ph1 + 48..ph1 + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
 
         // 4. Mã máy Ring 3 x86_64 tại file offset 256 (ánh xạ vào 0x0040_1000):
-        let code: [u8; 98] = [
+        let code: [u8; 109] = [
             0x4c, 0x8b, 0x24, 0x24, // mov r12, qword ptr [rsp] (đọc argc = 2)
             0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax, 39 (SYS_getpid)
             0x0f, 0x05, // syscall
