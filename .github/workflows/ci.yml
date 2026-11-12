@@ -1,0 +1,107 @@
+name: ZenithOS Fast CI
+
+on:
+  push:
+    branches: ["main", "master", "develop"]
+  pull_request:
+    branches: ["main", "master", "develop"]
+
+env:
+  CARGO_TERM_COLOR: always
+  LIMINE_VERSION: "v8.7.0-binary"
+
+jobs:
+  build-and-qemu-test:
+    name: Build & Boot ZenithOS (x86_64 QEMU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust Nightly Toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src, llvm-tools-preview, rustfmt, clippy
+          targets: x86_64-unknown-none
+
+      - name: Cache Cargo & build-std Artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: true
+
+      - name: Cache Limine Bootloader Binary
+        id: cache-limine
+        uses: actions/cache@v4
+        with:
+          path: /tmp/limine
+          key: limine-bin-${{ env.LIMINE_VERSION }}
+
+      - name: Install QEMU & ISO Tools (Fast apt-get)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            xorriso \
+            mtools
+
+      - name: Fetch & Build Limine CLI (if not cached)
+        if: steps.cache-limine.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/limine-bootloader/limine.git --branch=${{ env.LIMINE_VERSION }} --depth=1 /tmp/limine
+          make -C /tmp/limine
+
+      - name: Static Analysis (Clippy & Format Check)
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy -- -D warnings
+
+      - name: Build ZenithOS Kernel
+        run: cargo build
+
+      - name: Package Bootable ZenithOS ISO (Limine)
+        run: |
+          mkdir -p iso_root/boot/limine
+          cp target/x86_64-unknown-none/debug/zenith-kernel iso_root/boot/
+          cat << 'EOF' > iso_root/boot/limine/limine.conf
+          timeout: 0
+          /ZenithOS
+              protocol: limine
+              kernel_path: boot():/boot/zenith-kernel
+          EOF
+          cp /tmp/limine/limine-bios.sys \
+             /tmp/limine/limine-bios-cd.bin \
+             /tmp/limine/limine-uefi-cd.bin \
+             iso_root/boot/limine/
+          xorriso -as mkisofs -b boot/limine/limine-bios-cd.bin \
+            -no-emul-boot -boot-load-size 4 -boot-info-table \
+            --efi-boot boot/limine/limine-uefi-cd.bin \
+            -efi-boot-part --efi-boot-image --protective-msdos-label \
+            iso_root -o zenith-os.iso
+          /tmp/limine/limine bios-install zenith-os.iso
+
+      - name: Run Automated Hardware & Linux ABI Tests in QEMU
+        run: |
+          set +e
+          timeout 15s qemu-system-x86_64 \
+            -M q35 \
+            -cpu max \
+            -m 128M \
+            -cdrom zenith-os.iso \
+            -display none \
+            -serial stdio \
+            -no-reboot \
+            -no-shutdown \
+            -device isa-debug-exit,iobase=0xf4,iosize=0x04
+          EXIT_CODE=$?
+          set -e
+          # QemuExitCode::Success (0x10) tạo ra exit status (0x10 << 1) | 1 = 33
+          if [ $EXIT_CODE -eq 33 ]; then
+            echo "✅ ZenithOS booted and passed all Phase 1 tests!"
+            exit 0
+          else
+            echo "❌ ZenithOS QEMU test failed with exit code: $EXIT_CODE"
+            exit 1
+          fi
