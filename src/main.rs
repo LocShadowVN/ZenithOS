@@ -657,13 +657,13 @@ pub mod ostd {
             asm!("mov {}, cr3", out(reg) cr3_raw, options(nostack, preserves_flags));
         }
         let pml4_phys = cr3_raw & 0x000F_FFFF_FFFF_F000;
-        let pml4_virt = pmm.phys_to_hhdm_virt(pml4_phys) as *mut PageTable;
+        let pml4_virt = pmm.phys_to_hhdm_virt(pml4_phys);
 
         let pdpt_phys = ensure_next_table(pmm, pml4_virt, p4_idx)?;
-        let pdpt_virt = pmm.phys_to_hhdm_virt(pdpt_phys) as *mut PageTable;
+        let pdpt_virt = pmm.phys_to_hhdm_virt(pdpt_phys);
 
         let pd_phys = ensure_next_table(pmm, pdpt_virt, p3_idx)?;
-        let pd_virt = pmm.phys_to_hhdm_virt(pd_phys) as *mut PageTable;
+        let pd_virt = pmm.phys_to_hhdm_virt(pd_phys);
 
         let pt_phys = ensure_next_table(pmm, pd_virt, p2_idx)?;
         let pt_virt = pmm.phys_to_hhdm_virt(pt_phys) as *mut PageTable;
@@ -680,9 +680,10 @@ pub mod ostd {
 
     fn ensure_next_table(
         pmm: &mut BitmapFrameAllocator,
-        table_virt: *mut PageTable,
+        table_virt_addr: u64,
         idx: usize,
     ) -> Result<u64, OstdError> {
+        let table_virt = table_virt_addr as *mut PageTable;
         // SAFETY:
         // `table_virt` là địa chỉ ảo HHDM của bảng trang hiện tại, `idx` nằm trong khoảng `0..512`.
         unsafe {
@@ -950,8 +951,8 @@ pub mod ostd {
 #[forbid(unsafe_code)]
 pub mod linux_abi {
     use crate::ostd::{
-        copy_from_buffer, copy_to_buffer, map_user_page, read_msr, write_msr,
-        BitmapFrameAllocator, Msr, SerialConsole, TrapFrame, PAGE_SIZE,
+        copy_from_buffer, copy_to_buffer, map_user_page, read_msr, write_msr, BitmapFrameAllocator,
+        Msr, SerialConsole, TrapFrame, PAGE_SIZE,
     };
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1147,8 +1148,7 @@ pub mod linux_abi {
             return Err(LinuxErrno::Einval);
         }
         let mut total_written: u64 = 0;
-        let mut idx: u64 = 0;
-        while idx < iovcnt {
+        for idx in 0..iovcnt {
             let entry_addr = iov_ptr.wrapping_add(idx.wrapping_mul(16));
             let mut raw_iov = [0u8; 16];
             copy_from_buffer(entry_addr, &mut raw_iov).map_err(|_| LinuxErrno::Efault)?;
@@ -1165,7 +1165,6 @@ pub mod linux_abi {
                 let n = sys_write(fd, iov_base, iov_len)?;
                 total_written = total_written.wrapping_add(n);
             }
-            idx += 1;
         }
         Ok(total_written)
     }
@@ -1327,7 +1326,7 @@ pub mod linux_abi {
 
             let seg_start_page = p_vaddr & !0xFFF;
             let seg_end = p_vaddr.wrapping_add(p_memsz);
-            let seg_end_page = (seg_end.wrapping_add(0xFFF)) & !0xFFF;
+            let seg_end_page = seg_end.wrapping_add(0xFFF) & !0xFFF;
 
             let mut page_va = seg_start_page;
             while page_va < seg_end_page {
@@ -1382,22 +1381,22 @@ pub mod linux_abi {
         // [4]: envp[0], [5]: NULL
         // [6..15]: Auxiliary Vector (AT_PAGESZ, AT_ENTRY, AT_PHENT, AT_PHNUM, AT_NULL)
         let table_words: [u64; 16] = [
-            2,          // argc
-            arg0_va,    // argv[0] = "/bin/init"
-            arg1_va,    // argv[1] = "--ci-verify"
-            0,          // argv[2] = NULL
-            env0_va,    // envp[0] = "OS=ZenithOS"
-            0,          // envp[1] = NULL
-            AT_PAGESZ,  // auxv[0].a_type
-            4096,       // auxv[0].a_val
-            AT_ENTRY,   // auxv[1].a_type
-            entry_rip,  // auxv[1].a_val
-            AT_PHENT,   // auxv[2].a_type
-            56,         // auxv[2].a_val
-            AT_PHNUM,   // auxv[3].a_type
-            phnum,      // auxv[3].a_val
-            AT_NULL,    // auxv[4].a_type
-            0,          // auxv[4].a_val
+            2,         // argc
+            arg0_va,   // argv[0] = "/bin/init"
+            arg1_va,   // argv[1] = "--ci-verify"
+            0,         // argv[2] = NULL
+            env0_va,   // envp[0] = "OS=ZenithOS"
+            0,         // envp[1] = NULL
+            AT_PAGESZ, // auxv[0].a_type
+            4096,      // auxv[0].a_val
+            AT_ENTRY,  // auxv[1].a_type
+            entry_rip, // auxv[1].a_val
+            AT_PHENT,  // auxv[2].a_type
+            56,        // auxv[2].a_val
+            AT_PHNUM,  // auxv[3].a_type
+            phnum,     // auxv[3].a_val
+            AT_NULL,   // auxv[4].a_type
+            0,         // auxv[4].a_val
         ];
 
         let rsp = str_area - 128;
