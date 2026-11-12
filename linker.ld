@@ -20,12 +20,12 @@ SECTIONS
 
     .rodata : ALIGN(4K) {
         *(.rodata .rodata.*)
-        KEEP(*(.requests_start_marker))
-        KEEP(*(.requests))
-        KEEP(*(.requests_end_marker))
     } :rodata
 
     .data : ALIGN(4K) {
+        KEEP(*(.requests_start_marker))
+        KEEP(*(.requests))
+        KEEP(*(.requests_end_marker))
         *(.data .data.*)
     } :data
 
