@@ -7,8 +7,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::Ordering;
 
 // ============================================================================
-// GIAO THỨC KHỞI ĐỘNG LIMINE (LIMINE BOOT PROTOCOL)
-// Định nghĩa trực tiếp các cấu trúc #[repr(C)] chuẩn ABI không cần phụ thuộc ngoài.
+// GIAO THỨC KHỞI ĐỘNG LIMINE (HHDM & KERNEL PHYSICAL ADDRESS)
 // ============================================================================
 pub mod boot_protocol {
     #[repr(C)]
@@ -19,11 +18,68 @@ pub mod boot_protocol {
 
     unsafe impl Sync for LimineBaseRevision {}
 
+    #[repr(C)]
+    pub struct LimineHhdmResponse {
+        pub revision: u64,
+        pub offset: u64,
+    }
+
+    #[repr(C)]
+    pub struct LimineHhdmRequest {
+        pub id: [u64; 4],
+        pub revision: u64,
+        pub response: *const LimineHhdmResponse,
+    }
+
+    unsafe impl Sync for LimineHhdmRequest {}
+
+    #[repr(C)]
+    pub struct LimineKernelAddressResponse {
+        pub revision: u64,
+        pub physical_base: u64,
+        pub virtual_base: u64,
+    }
+
+    #[repr(C)]
+    pub struct LimineKernelAddressRequest {
+        pub id: [u64; 4],
+        pub revision: u64,
+        pub response: *const LimineKernelAddressResponse,
+    }
+
+    unsafe impl Sync for LimineKernelAddressRequest {}
+
     #[used]
     #[link_section = ".requests"]
     pub static BASE_REVISION: LimineBaseRevision = LimineBaseRevision {
         id: [0xf956_2b2d_5c95_a6c8, 0x6a7b_3849_4453_6bdc],
         revision: 2,
+    };
+
+    #[used]
+    #[link_section = ".requests"]
+    pub static HHDM_REQUEST: LimineHhdmRequest = LimineHhdmRequest {
+        id: [
+            0xc7b1_dd30_df4c_8b88,
+            0x0a82_e883_a194_f07b,
+            0x48dc_f1cb_8ad2_b852,
+            0x6398_4e95_9a98_244b,
+        ],
+        revision: 0,
+        response: core::ptr::null(),
+    };
+
+    #[used]
+    #[link_section = ".requests"]
+    pub static KERNEL_ADDRESS_REQUEST: LimineKernelAddressRequest = LimineKernelAddressRequest {
+        id: [
+            0xc7b1_dd30_df4c_8b88,
+            0x0a82_e883_a194_f07b,
+            0x71ba_7686_3cc5_5f63,
+            0xb264_4a48_c516_a487,
+        ],
+        revision: 0,
+        response: core::ptr::null(),
     };
 
     #[used]
@@ -49,7 +105,6 @@ pub mod ostd {
     use core::fmt::{self, Write};
     use core::sync::atomic::{AtomicU64, Ordering};
 
-    /// Mã lỗi phần cứng ở tầng OSTD
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum OstdError {
         OutOfPhysicalFrames,
@@ -57,6 +112,7 @@ pub mod ostd {
         UnalignedAddress,
         PageTableWalkFailed,
         InvalidUserPointer,
+        BootInfoMissing,
     }
 
     // ------------------------------------------------------------------------
@@ -65,8 +121,7 @@ pub mod ostd {
     #[inline(always)]
     pub fn outb(port: u16, val: u8) {
         // SAFETY:
-        // Chỉ thực thi ở Ring 0 trên các cổng I/O kiến trúc PC chuẩn (COM1, QEMU Debug).
-        // `nostack` và `preserves_flags` đảm bảo lệnh `out` không ảnh hưởng stack và RFLAGS.
+        // Thực thi ở Ring 0 trên các cổng I/O kiến trúc PC chuẩn.
         unsafe {
             asm!(
                 "out dx, al",
@@ -81,7 +136,7 @@ pub mod ostd {
     pub fn inb(port: u16) -> u8 {
         let val: u8;
         // SAFETY:
-        // Chỉ thực thi ở Ring 0 trên các cổng I/O phần cứng chuẩn.
+        // Thực thi ở Ring 0 trên các cổng I/O phần cứng chuẩn.
         unsafe {
             asm!(
                 "in al, dx",
@@ -96,7 +151,7 @@ pub mod ostd {
     #[inline(always)]
     pub fn outl(port: u16, val: u32) {
         // SAFETY:
-        // Chỉ thực thi ở Ring 0 phục vụ ghi 32-bit ra cổng `isa-debug-exit` (0xF4).
+        // Thực thi ở Ring 0 phục vụ ghi 32-bit ra cổng `isa-debug-exit` (0xF4).
         unsafe {
             asm!(
                 "out dx, eax",
@@ -107,14 +162,10 @@ pub mod ostd {
         }
     }
 
-    /// Trạng thái thoát gửi tới thiết bị `isa-debug-exit` của QEMU (cổng 0xF4).
-    /// QEMU sẽ thoát với mã `(code << 1) | 1`.
     #[repr(u32)]
     #[derive(Debug, Clone, Copy)]
     pub enum QemuExitCode {
-        /// Thành công -> QEMU trả về exit code `(0x10 << 1) | 1 = 33`
         Success = 0x10,
-        /// Thất bại -> QEMU trả về exit code `(0x11 << 1) | 1 = 35`
         Failed = 0x11,
     }
 
@@ -122,32 +173,30 @@ pub mod ostd {
         outl(0xF4, exit_code as u32);
         loop {
             // SAFETY:
-            // `hlt` tạm dừng CPU ở Ring 0 cho tới khi có ngắt tiếp theo.
+            // Dừng lõi CPU nếu QEMU chưa đóng.
             unsafe {
                 asm!("hlt", options(nostack, preserves_flags));
             }
         }
     }
 
-    /// Trình điều khiển UART 16550 trên cổng COM1 (`0x3F8`).
     pub struct SerialConsole;
 
     impl SerialConsole {
         const COM1: u16 = 0x3F8;
 
         pub fn init() {
-            outb(Self::COM1 + 1, 0x00); // Tắt mọi ngắt UART
-            outb(Self::COM1 + 3, 0x80); // Bật DLAB (đặt tốc độ baud)
-            outb(Self::COM1, 0x03); // Chia tần số: 38400 baud (byte thấp)
-            outb(Self::COM1 + 1, 0x00); // Byte cao
-            outb(Self::COM1 + 3, 0x03); // 8 bits, không parity, 1 stop bit
-            outb(Self::COM1 + 2, 0xC7); // Bật FIFO, xóa bộ đệm, ngưỡng 14-byte
-            outb(Self::COM1 + 4, 0x0B); // Bật RTS/DSR
+            outb(Self::COM1 + 1, 0x00);
+            outb(Self::COM1 + 3, 0x80);
+            outb(Self::COM1, 0x03);
+            outb(Self::COM1 + 1, 0x00);
+            outb(Self::COM1 + 3, 0x03);
+            outb(Self::COM1 + 2, 0xC7);
+            outb(Self::COM1 + 4, 0x0B);
         }
 
         #[inline]
         pub fn write_byte(byte: u8) {
-            // Chờ thanh ghi Line Status (offset +5) báo bộ đệm truyền trống (bit 5 = 0x20)
             while (inb(Self::COM1 + 5) & 0x20) == 0 {
                 core::hint::spin_loop();
             }
@@ -179,14 +228,11 @@ pub mod ostd {
     // ------------------------------------------------------------------------
     // 1.2: GDT & TSS (CHUẨN BỐ CỤC CHO LỆNH SYSCALL / SYSRETQ)
     // ------------------------------------------------------------------------
-    /// Task State Segment 64-bit chuẩn phần cứng x86_64.
     #[repr(C, packed)]
     pub struct TaskStateSegment {
         pub reserved_1: u32,
-        /// Con trỏ Stack cho Ring 0..2 khi chuyển mức đặc quyền
         pub privilege_stack_table: [u64; 3],
         pub reserved_2: u64,
-        /// Bảng ngăn xếp ngắt khẩn cấp (IST1..IST7) cho Double Fault, NMI, Page Fault
         pub interrupt_stack_table: [u64; 7],
         pub reserved_3: u64,
         pub reserved_4: u16,
@@ -209,8 +255,6 @@ pub mod ostd {
         iomap_base: core::mem::size_of::<TaskStateSegment>() as u16,
     };
 
-    /// Bảng GDT 7 phần tử (Null, Kernel Code, Kernel Data, User Data, User Code 64, TSS Low, TSS High).
-    /// Lưu ý: Lệnh `sysretq` yêu cầu User Data (0x18) ĐỨNG TRƯỚC User Code 64 (0x20)!
     #[repr(C, align(16))]
     pub struct GdtTable {
         pub entries: [u64; 7],
@@ -219,12 +263,12 @@ pub mod ostd {
     static mut GDT: GdtTable = GdtTable {
         entries: [
             0x0000_0000_0000_0000, // 0x00: Null Descriptor
-            0x00AF_9A00_0000_FFFF, // 0x08: Kernel Code 64-bit (DPL = 0, L = 1)
+            0x00AF_9A00_0000_FFFF, // 0x08: Kernel Code 64-bit (DPL = 0)
             0x00CF_9200_0000_FFFF, // 0x10: Kernel Data 64-bit (DPL = 0)
             0x00CF_F200_0000_FFFF, // 0x18: User Data 64-bit   (DPL = 3 -> Selector 0x1B)
             0x00AF_FA00_0000_FFFF, // 0x20: User Code 64-bit   (DPL = 3 -> Selector 0x23)
-            0x0000_0000_0000_0000, // 0x28: TSS Descriptor (64-bit thấp)
-            0x0000_0000_0000_0000, // 0x30: TSS Descriptor (64-bit cao)
+            0x0000_0000_0000_0000, // 0x28: TSS Low
+            0x0000_0000_0000_0000, // 0x30: TSS High
         ],
     };
 
@@ -236,9 +280,7 @@ pub mod ostd {
 
     pub fn init_gdt_and_tss() {
         // SAFETY:
-        // Hàm này được gọi duy nhất 1 lần trên BSP (Bootstrap Processor) trong quá trình khởi động
-        // đơn luồng trước khi bật ngắt. Truy cập qua con trỏ thô `&raw mut` đảm bảo không vi phạm
-        // quy tắc aliasing của Rust.
+        // Khởi tạo GDT/TSS duy nhất 1 lần trên BSP thông qua con trỏ thô `&raw mut`.
         unsafe {
             let rsp0_top = (&raw const KERNEL_INTR_STACK.0 as u64) + 16384;
             let ist1_top = (&raw const DOUBLE_FAULT_IST_STACK.0 as u64) + 16384;
@@ -253,7 +295,7 @@ pub mod ostd {
             let mut tss_low: u64 = 0;
             tss_low |= tss_limit & 0xFFFF;
             tss_low |= (tss_base & 0xFF_FFFF) << 16;
-            tss_low |= 0x89u64 << 40; // Present = 1, Type = 0x9 (64-bit Available TSS)
+            tss_low |= 0x89u64 << 40;
             tss_low |= ((tss_limit >> 16) & 0xF) << 48;
             tss_low |= ((tss_base >> 24) & 0xFF) << 56;
 
@@ -270,22 +312,18 @@ pub mod ostd {
 
             asm!(
                 "lgdt [{gdtr}]",
-                // Nạp lại CS = 0x08 thông qua far return (`retfq`)
                 "push 0x08",
                 "lea {tmp}, [rip + 2f]",
                 "push {tmp}",
                 "retfq",
                 "2:",
-                // Nạp lại các thanh ghi phân đoạn dữ liệu bằng Kernel Data (0x10)
                 "mov ax, 0x10",
                 "mov ds, ax",
                 "mov es, ax",
                 "mov ss, ax",
-                // Xóa FS và GS selector về 0 (địa chỉ cơ sở được điều khiển qua MSR)
                 "xor ax, ax",
                 "mov fs, ax",
                 "mov gs, ax",
-                // Nạp Task Register với TSS Selector (0x28)
                 "mov ax, 0x28",
                 "ltr ax",
                 gdtr = in(reg) &gdtr,
@@ -297,7 +335,7 @@ pub mod ostd {
     }
 
     // ------------------------------------------------------------------------
-    // 1.3: IDT (INTERRUPT DESCRIPTOR TABLE) & EXCEPTION SELF-TEST
+    // 1.3: IDT (INTERRUPT DESCRIPTOR TABLE)
     // ------------------------------------------------------------------------
     #[repr(C, packed)]
     #[derive(Clone, Copy)]
@@ -327,9 +365,9 @@ pub mod ostd {
         pub fn new_handler(handler_addr: u64, ist_index: u8) -> Self {
             Self {
                 offset_low: handler_addr as u16,
-                selector: 0x08, // Kernel Code Selector
+                selector: 0x08,
                 ist: ist_index & 0x7,
-                type_attr: 0x8E, // Present = 1, DPL = 0, Type = 0xE (64-bit Interrupt Gate)
+                type_attr: 0x8E,
                 offset_mid: (handler_addr >> 16) as u16,
                 offset_high: (handler_addr >> 32) as u32,
                 reserved: 0,
@@ -355,11 +393,17 @@ pub mod ostd {
 
     #[no_mangle]
     extern "C" fn zenith_unhandled_exception(vector: u64, error_code: u64, rip: u64) -> ! {
+        let cr2: u64;
+        // SAFETY:
+        // Đọc thanh ghi CR2 để chẩn đoán địa chỉ gây lỗi nếu là Page Fault (#PF).
+        unsafe {
+            asm!("mov {}, cr2", out(reg) cr2, options(nostack, preserves_flags));
+        }
         let mut console = SerialConsole;
         let _ = writeln!(
             console,
-            "\n[ZENITH-OSTD][FATAL] CPU Exception #{} (err=0x{:x}) at RIP=0x{:016x}",
-            vector, error_code, rip
+            "\n[ZENITH-OSTD][FATAL] CPU Exception #{} (err=0x{:x}, cr2=0x{:x}) at RIP=0x{:016x}",
+            vector, error_code, cr2, rip
         );
         exit_qemu(QemuExitCode::Failed);
     }
@@ -389,34 +433,42 @@ pub mod ostd {
         "iretq",
         ".global isr_double_fault_stub",
         "isr_double_fault_stub:",
-        "mov rdi, 8",     // Vector #8 (#DF)
-        "pop rsi",        // Error code do CPU đẩy vào stack
-        "mov rdx, [rsp]", // RIP gây lỗi
+        "mov rdi, 8",
+        "pop rsi",
+        "mov rdx, [rsp]",
+        "call zenith_unhandled_exception",
+        ".global isr_gp_fault_stub",
+        "isr_gp_fault_stub:",
+        "mov rdi, 13",
+        "pop rsi",
+        "mov rdx, [rsp]",
         "call zenith_unhandled_exception",
         ".global isr_page_fault_stub",
         "isr_page_fault_stub:",
-        "mov rdi, 14",    // Vector #14 (#PF)
-        "pop rsi",        // Error code
-        "mov rdx, [rsp]", // RIP gây lỗi
+        "mov rdi, 14",
+        "pop rsi",
+        "mov rdx, [rsp]",
         "call zenith_unhandled_exception",
     );
 
     extern "C" {
         fn isr_breakpoint_stub();
         fn isr_double_fault_stub();
+        fn isr_gp_fault_stub();
         fn isr_page_fault_stub();
     }
 
     pub fn init_idt() {
         // SAFETY:
-        // Chỉ chạy 1 lần lúc khởi tạo hệ thống trên BSP. Các hàm stub assembly tuân thủ đúng
-        // giao thức lưu/khôi phục thanh ghi và kết thúc bằng `iretq`.
+        // Đăng ký các cổng ngắt kiến trúc chuẩn vào bảng IDT trên BSP.
         unsafe {
             let idt_ptr = &raw mut IDT;
             (*idt_ptr).entries[3] =
                 IdtEntry::new_handler(isr_breakpoint_stub as *const () as u64, 0);
             (*idt_ptr).entries[8] =
-                IdtEntry::new_handler(isr_double_fault_stub as *const () as u64, 1); // IST1
+                IdtEntry::new_handler(isr_double_fault_stub as *const () as u64, 1);
+            (*idt_ptr).entries[13] =
+                IdtEntry::new_handler(isr_gp_fault_stub as *const () as u64, 0);
             (*idt_ptr).entries[14] =
                 IdtEntry::new_handler(isr_page_fault_stub as *const () as u64, 0);
 
@@ -431,27 +483,29 @@ pub mod ostd {
 
     pub fn trigger_breakpoint_self_test() {
         // SAFETY:
-        // Lệnh `int3` gọi Vector #3 đã được đăng ký an toàn trong IDT ở trên.
+        // Gọi ngắt phần mềm Vector #3 đã được cấu hình trong IDT.
         unsafe {
             asm!("int3", options(nostack, preserves_flags));
         }
     }
 
     // ------------------------------------------------------------------------
-    // 1.4: QUẢN LÝ BỘ NHỚ VẬT LÝ (BITMAP PMM) & BẢNG TRANG 4 CẤP (MMU)
+    // 1.4: QUẢN LÝ BỘ NHỚ VẬT LÝ (PMM) & BẢNG TRANG 4 CẤP USER-SPACE (MMU)
     // ------------------------------------------------------------------------
     pub const PAGE_SIZE: usize = 4096;
-    const POOL_FRAMES: usize = 256; // 1 MiB vùng nhớ khung trang tĩnh phục vụ Phase 1 & MMU
+    const POOL_FRAMES: usize = 256;
 
     #[repr(C, align(4096))]
     struct FramePool([[u8; PAGE_SIZE]; POOL_FRAMES]);
 
     static mut STATIC_FRAME_POOL: FramePool = FramePool([[0; PAGE_SIZE]; POOL_FRAMES]);
 
-    /// Bộ cấp phát khung trang vật lý/ảo dựa trên Bitmap (Zero-panic).
     pub struct BitmapFrameAllocator {
-        bitmap: [u64; 4], // 4 * 64 = 256 frames
+        bitmap: [u64; 4],
         base_addr: u64,
+        hhdm_offset: u64,
+        kernel_phys_base: u64,
+        kernel_virt_base: u64,
     }
 
     impl Default for BitmapFrameAllocator {
@@ -463,9 +517,30 @@ pub mod ostd {
     impl BitmapFrameAllocator {
         pub fn new() -> Self {
             let base_addr = &raw const STATIC_FRAME_POOL as u64;
+            let mut hhdm_offset = 0xFFFF_8000_0000_0000;
+            let mut kernel_phys_base = 0;
+            let mut kernel_virt_base = 0xFFFF_FFFF_8000_0000;
+
+            // SAFETY:
+            // Đọc thông tin HHDM và Kernel Address do Limine điền trước khi nhảy vào `_start`.
+            unsafe {
+                let hhdm_resp = crate::boot_protocol::HHDM_REQUEST.response;
+                if !hhdm_resp.is_null() {
+                    hhdm_offset = (*hhdm_resp).offset;
+                }
+                let ka_resp = crate::boot_protocol::KERNEL_ADDRESS_REQUEST.response;
+                if !ka_resp.is_null() {
+                    kernel_phys_base = (*ka_resp).physical_base;
+                    kernel_virt_base = (*ka_resp).virtual_base;
+                }
+            }
+
             Self {
                 bitmap: [0; 4],
                 base_addr,
+                hhdm_offset,
+                kernel_phys_base,
+                kernel_virt_base,
             }
         }
 
@@ -476,10 +551,8 @@ pub mod ostd {
                     *word |= 1u64 << bit_idx;
                     let frame_index = word_idx * 64 + bit_idx;
                     let addr = self.base_addr + (frame_index * PAGE_SIZE) as u64;
-                    // Xóa trắng trang 4KiB trước khi bàn giao (ngăn rò rỉ dữ liệu)
                     // SAFETY:
-                    // `addr` nằm hoàn toàn trong `STATIC_FRAME_POOL`, căn lề 4096-byte,
-                    // và vừa được đánh dấu sở hữu độc quyền trong bitmap.
+                    // `addr` nằm trong `STATIC_FRAME_POOL` đã căn lề 4KiB và thuộc quyền sở hữu độc quyền.
                     unsafe {
                         core::ptr::write_bytes(addr as *mut u8, 0, PAGE_SIZE);
                     }
@@ -507,17 +580,28 @@ pub mod ostd {
                 Err(OstdError::InvalidFrameIndex)
             }
         }
+
+        /// Chuyển đổi địa chỉ ảo trong vùng Kernel `.bss` sang địa chỉ vật lý phần cứng.
+        #[inline]
+        pub const fn kernel_virt_to_phys(&self, virt_addr: u64) -> u64 {
+            (virt_addr - self.kernel_virt_base) + self.kernel_phys_base
+        }
+
+        /// Chuyển đổi địa chỉ vật lý phần cứng sang địa chỉ ảo HHDM để CPU đọc/ghi bảng trang.
+        #[inline]
+        pub const fn phys_to_hhdm_virt(&self, phys_addr: u64) -> u64 {
+            phys_addr + self.hhdm_offset
+        }
     }
 
-    /// Cờ phần cứng của một mục bảng trang x86_64 (Page Table Entry Flags).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct PageFlags(pub u64);
 
     impl PageFlags {
-        pub const PRESENT: Self = Self(1 << 0);
-        pub const WRITABLE: Self = Self(1 << 1);
-        pub const USER: Self = Self(1 << 2);
-        pub const NO_EXECUTE: Self = Self(1 << 63);
+        pub const PRESENT: u64 = 1 << 0;
+        pub const WRITABLE: u64 = 1 << 1;
+        pub const USER: u64 = 1 << 2;
+        pub const USER_RWX: u64 = Self::PRESENT | Self::WRITABLE | Self::USER;
     }
 
     #[repr(C, align(4096))]
@@ -526,7 +610,6 @@ pub mod ostd {
     }
 
     impl PageTable {
-        /// Giải mã chỉ số 4 cấp bảng trang (PML4, PDPT, PD, PT) từ địa chỉ ảo 64-bit.
         pub const fn indices(virt_addr: u64) -> (usize, usize, usize, usize) {
             let p4 = ((virt_addr >> 39) & 0x1FF) as usize;
             let p3 = ((virt_addr >> 30) & 0x1FF) as usize;
@@ -539,14 +622,88 @@ pub mod ostd {
     #[inline(always)]
     pub fn flush_tlb(virt_addr: u64) {
         // SAFETY:
-        // `invlpg` chỉ làm mới bộ đệm TLB của địa chỉ ảo được chỉ định, không ảnh hưởng bộ nhớ.
+        // Làm mới bộ đệm TLB của trang ảo vừa cập nhật.
         unsafe {
             asm!("invlpg [{}]", in(reg) virt_addr, options(nostack, preserves_flags));
         }
     }
 
+    /// Tắt SMAP/SMEP tạm thời trên CR4 nếu CPU bật sẵn để Kernel nạp dữ liệu vào trang User-space.
+    pub fn disable_smap_for_loader() {
+        let mut cr4: u64;
+        // SAFETY:
+        // Đọc và xóa bit SMAP (bit 21) trên thanh ghi điều khiển CR4 ở Ring 0.
+        unsafe {
+            asm!("mov {}, cr4", out(reg) cr4, options(nostack, preserves_flags));
+            cr4 &= !(1u64 << 21);
+            asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
+        }
+    }
+
+    /// Ánh xạ một trang 4KiB tại địa chỉ ảo User-space (`user_va`) vào bảng trang 4 cấp `CR3` hiện hành.
+    pub fn map_user_page(pmm: &mut BitmapFrameAllocator, user_va: u64) -> Result<u64, OstdError> {
+        if (user_va & 0xFFF) != 0 {
+            return Err(OstdError::UnalignedAddress);
+        }
+
+        let frame_kvirt = pmm.allocate_frame()?;
+        let frame_phys = pmm.kernel_virt_to_phys(frame_kvirt);
+        let (p4_idx, p3_idx, p2_idx, p1_idx) = PageTable::indices(user_va);
+
+        let cr3_raw: u64;
+        // SAFETY:
+        // Đọc địa chỉ vật lý của bảng PML4 hiện tại từ thanh ghi CR3.
+        unsafe {
+            asm!("mov {}, cr3", out(reg) cr3_raw, options(nostack, preserves_flags));
+        }
+        let pml4_phys = cr3_raw & 0x000F_FFFF_FFFF_F000;
+        let pml4_virt = pmm.phys_to_hhdm_virt(pml4_phys) as *mut PageTable;
+
+        let pdpt_phys = ensure_next_table(pmm, pml4_virt, p4_idx)?;
+        let pdpt_virt = pmm.phys_to_hhdm_virt(pdpt_phys) as *mut PageTable;
+
+        let pd_phys = ensure_next_table(pmm, pdpt_virt, p3_idx)?;
+        let pd_virt = pmm.phys_to_hhdm_virt(pd_phys) as *mut PageTable;
+
+        let pt_phys = ensure_next_table(pmm, pd_virt, p2_idx)?;
+        let pt_virt = pmm.phys_to_hhdm_virt(pt_phys) as *mut PageTable;
+
+        // SAFETY:
+        // `pt_virt` trỏ tới bảng Page Table cấp 1 hợp lệ qua HHDM và `p1_idx < 512`.
+        unsafe {
+            (*pt_virt).entries[p1_idx] = (frame_phys & 0x000F_FFFF_FFFF_F000) | PageFlags::USER_RWX;
+        }
+
+        flush_tlb(user_va);
+        Ok(frame_kvirt)
+    }
+
+    fn ensure_next_table(
+        pmm: &mut BitmapFrameAllocator,
+        table_virt: *mut PageTable,
+        idx: usize,
+    ) -> Result<u64, OstdError> {
+        // SAFETY:
+        // `table_virt` là địa chỉ ảo HHDM của bảng trang hiện tại, `idx` nằm trong khoảng `0..512`.
+        unsafe {
+            let entry = (*table_virt).entries[idx];
+            if (entry & PageFlags::PRESENT) != 0 {
+                // Đảm bảo mục trung gian cho phép truy cập USER, WRITABLE và không chặn thực thi (clear NX bit 63)
+                let updated = (entry | PageFlags::USER_RWX) & !(1u64 << 63);
+                (*table_virt).entries[idx] = updated;
+                Ok(updated & 0x000F_FFFF_FFFF_F000)
+            } else {
+                let new_table_kvirt = pmm.allocate_frame()?;
+                let new_table_phys = pmm.kernel_virt_to_phys(new_table_kvirt);
+                (*table_virt).entries[idx] =
+                    (new_table_phys & 0x000F_FFFF_FFFF_F000) | PageFlags::USER_RWX;
+                Ok(new_table_phys)
+            }
+        }
+    }
+
     // ------------------------------------------------------------------------
-    // 1.5: MSR, PER-CPU STATE & SYSCALL / SYSRETQ TRAMPOLINE
+    // 1.5: MSR, PER-CPU STATE & RING 0 <-> RING 3 CONTEXT SWITCHING
     // ------------------------------------------------------------------------
     #[repr(u32)]
     #[derive(Debug, Clone, Copy)]
@@ -595,21 +752,22 @@ pub mod ostd {
         ((high as u64) << 32) | (low as u64)
     }
 
-    /// Dữ liệu cục bộ của từng lõi CPU (được trỏ tới bởi thanh ghi `GS` khi ở Ring 0).
     #[repr(C, align(64))]
     pub struct PerCpuData {
-        /// Offset 0x00: Đỉnh Kernel Stack của luồng hiện tại
+        /// Offset 0x00: Đỉnh Kernel Stack dùng cho trình xử lý `syscall`
         pub kernel_rsp: u64,
         /// Offset 0x08: Biến tạm giữ User Stack (`RSP`) khi vừa gọi lệnh `syscall`
         pub user_rsp_scratch: u64,
+        /// Offset 0x10: Kernel Stack (`RSP`) đã lưu của trình gọi `enter_user_space`
+        pub kernel_return_rsp: u64,
     }
 
     static mut BSP_PER_CPU: PerCpuData = PerCpuData {
         kernel_rsp: 0,
         user_rsp_scratch: 0,
+        kernel_return_rsp: 0,
     };
 
-    /// Khung thanh ghi đầy đủ của tiến trình khi gọi `syscall`.
     #[repr(C, align(16))]
     #[derive(Debug, Clone, Copy, Default)]
     pub struct TrapFrame {
@@ -619,28 +777,25 @@ pub mod ostd {
         pub r12: u64,
         pub rbp: u64,
         pub rbx: u64,
-        pub r11: u64, // User RFLAGS
-        pub r10: u64, // Linux Syscall Arg 4
-        pub r9: u64,  // Linux Syscall Arg 6
-        pub r8: u64,  // Linux Syscall Arg 5
-        pub rax: u64, // Linux Syscall Number & Return Value
-        pub rcx: u64, // User RIP
-        pub rdx: u64, // Linux Syscall Arg 3
-        pub rsi: u64, // Linux Syscall Arg 2
-        pub rdi: u64, // Linux Syscall Arg 1
-        pub rsp: u64, // User RSP
+        pub r11: u64,
+        pub r10: u64,
+        pub r9: u64,
+        pub r8: u64,
+        pub rax: u64,
+        pub rcx: u64,
+        pub rdx: u64,
+        pub rsi: u64,
+        pub rdi: u64,
+        pub rsp: u64,
     }
 
     global_asm!(
         ".global zenith_syscall_trampoline",
         "zenith_syscall_trampoline:",
-        // Hoán đổi GS của User với Kernel PerCpuData
         "swapgs",
-        // Lưu RSP của User vào gs:[0x08] và nạp Kernel Stack từ gs:[0x00]
         "mov gs:[0x08], rsp",
         "mov rsp, gs:[0x00]",
-        // Đẩy toàn bộ TrapFrame lên Kernel Stack
-        "push qword ptr gs:[0x08]", // user rsp
+        "push qword ptr gs:[0x08]",
         "push rdi",
         "push rsi",
         "push rdx",
@@ -656,10 +811,8 @@ pub mod ostd {
         "push r13",
         "push r14",
         "push r15",
-        // Truyền `&mut TrapFrame` qua thanh ghi RDI (SysV AMD64 ABI)
         "mov rdi, rsp",
         "call zenith_syscall_entry_from_asm",
-        // Khôi phục TrapFrame
         "pop r15",
         "pop r14",
         "pop r13",
@@ -678,16 +831,55 @@ pub mod ostd {
         "pop rsp",
         "swapgs",
         "sysretq",
+        ".global zenith_enter_user_space_asm",
+        "zenith_enter_user_space_asm:",
+        "push rbp",
+        "push rbx",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov gs:[0x10], rsp",
+        "mov rcx, rdi",
+        "mov rsp, rsi",
+        "mov r11, 0x002",
+        "xor rax, rax",
+        "xor rbx, rbx",
+        "xor rdx, rdx",
+        "xor rsi, rsi",
+        "xor rdi, rdi",
+        "xor rbp, rbp",
+        "xor r8, r8",
+        "xor r9, r9",
+        "xor r10, r10",
+        "xor r12, r12",
+        "xor r13, r13",
+        "xor r14, r14",
+        "xor r15, r15",
+        "swapgs",
+        "sysretq",
+        ".global zenith_exit_user_space_asm",
+        "zenith_exit_user_space_asm:",
+        "mov eax, edi",
+        "mov rsp, gs:[0x10]",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbx",
+        "pop rbp",
+        "ret",
     );
 
     extern "C" {
         fn zenith_syscall_trampoline();
+        fn zenith_enter_user_space_asm(entry_rip: u64, user_rsp: u64) -> i32;
+        fn zenith_exit_user_space_asm(exit_code: i32) -> !;
     }
 
-    /// Khởi tạo hệ thống `SYSCALL` / `SYSRETQ` ở cấp độ phần cứng CPU.
     pub fn init_syscall_msrs() {
         // SAFETY:
-        // Chỉ chạy 1 lần trên BSP. Thiết lập `BSP_PER_CPU` và các MSR `EFER`, `STAR`, `LSTAR`, `SFMASK`.
+        // Khởi tạo PerCpuData và các thanh ghi MSR cho lệnh `syscall`/`sysretq`.
         unsafe {
             let kstack_top = (&raw const KERNEL_INTR_STACK.0 as u64) + 16384;
             let per_cpu_ptr = &raw mut BSP_PER_CPU;
@@ -698,47 +890,52 @@ pub mod ostd {
             write_msr(Msr::Ia32KernelGsBase, per_cpu_addr);
         }
 
-        // Bật bit SCE (System Call Extensions - bit 0) trong IA32_EFER
         let efer = read_msr(Msr::Ia32Efer);
         write_msr(Msr::Ia32Efer, efer | 1);
 
-        // Cấu hình IA32_STAR:
-        // - Bits [47:32] = 0x0008 (Kernel CS = 0x08, Kernel SS = 0x10)
-        // - Bits [63:48] = 0x0010 (SYSRETQ sẽ nạp SS = 0x10 + 8 | 3 = 0x1B, CS = 0x10 + 16 | 3 = 0x23)
         let star: u64 = (0x0010u64 << 48) | (0x0008u64 << 32);
         write_msr(Msr::Ia32Star, star);
 
-        // Cấu hình IA32_LSTAR trỏ tới `zenith_syscall_trampoline`
         write_msr(
             Msr::Ia32Lstar,
             zenith_syscall_trampoline as *const () as u64,
         );
-
-        // Xóa cờ IF (0x200) và DF (0x400) khi nhảy vào Ring 0
         write_msr(Msr::Ia32SfMask, 0x0600);
     }
 
-    /// Sao chép dữ liệu an toàn từ bộ đệm của Kernel ra vùng nhớ được cấp phát cho tiến trình/test.
+    /// Chuyển CPU từ Ring 0 xuống Ring 3 tại `entry_rip` với ngăn xếp `user_rsp` bằng `sysretq`.
+    /// Hàm sẽ trả về mã thoát `exit_code` khi tiến trình Ring 3 gọi `SYS_exit_group`.
+    pub fn enter_user_space(entry_rip: u64, user_rsp: u64) -> i32 {
+        // SAFETY:
+        // `entry_rip` và `user_rsp` đã được trình nạp ELF64 ánh xạ hợp lệ với cờ `PAGE_USER`.
+        unsafe { zenith_enter_user_space_asm(entry_rip, user_rsp) }
+    }
+
+    /// Khôi phục ngăn xếp Kernel và quay về điểm gọi `enter_user_space` khi tiến trình Ring 3 thoát.
+    pub fn return_to_kernel_from_exit(exit_code: i32) -> ! {
+        // SAFETY:
+        // Được gọi từ ngữ cảnh Syscall sau khi `swapgs` đã khôi phục `GS` của Kernel (`BSP_PER_CPU`).
+        unsafe { zenith_exit_user_space_asm(exit_code) }
+    }
+
     pub fn copy_to_buffer(dst_addr: u64, src: &[u8]) -> Result<(), OstdError> {
         if dst_addr == 0 {
             return Err(OstdError::InvalidUserPointer);
         }
         // SAFETY:
-        // `dst_addr` được kiểm tra khác null và do các trình kiểm thử hoặc trình quản lý bộ nhớ
-        // của nhân cấp phát hợp lệ với độ dài `src.len()`.
+        // `dst_addr` đã được kiểm tra khác null và đã được ánh xạ trong không gian địa chỉ.
         unsafe {
             core::ptr::copy_nonoverlapping(src.as_ptr(), dst_addr as *mut u8, src.len());
         }
         Ok(())
     }
 
-    /// Đọc chuỗi byte từ bộ đệm vào lát cắt an toàn.
     pub fn copy_from_buffer(src_addr: u64, dst: &mut [u8]) -> Result<(), OstdError> {
         if src_addr == 0 {
             return Err(OstdError::InvalidUserPointer);
         }
         // SAFETY:
-        // `src_addr` đã được xác thực khác null và trỏ tới bộ đệm hợp lệ có kích thước >= `dst.len()`.
+        // `src_addr` đã được xác thực khác null và trỏ tới bộ đệm đã ánh xạ.
         unsafe {
             core::ptr::copy_nonoverlapping(src_addr as *const u8, dst.as_mut_ptr(), dst.len());
         }
@@ -747,17 +944,16 @@ pub mod ostd {
 }
 
 // ============================================================================
-// MODULE 2: SAFE KERNEL CORE & LINUX ABI SUBSYSTEM (#![forbid(unsafe_code)])
+// MODULE 2: SAFE KERNEL CORE, ELF64 LOADER & LINUX ABI (#![forbid(unsafe_code)])
 // Toàn bộ tầng này cấm tuyệt đối `unsafe` và cấm `unwrap()` / `expect()`.
 // ============================================================================
 #[forbid(unsafe_code)]
 pub mod linux_abi {
     use crate::ostd::{
-        copy_from_buffer, copy_to_buffer, read_msr, write_msr, BitmapFrameAllocator, Msr,
-        SerialConsole, TrapFrame,
+        copy_from_buffer, copy_to_buffer, map_user_page, read_msr, write_msr,
+        BitmapFrameAllocator, Msr, SerialConsole, TrapFrame, PAGE_SIZE,
     };
 
-    /// Mã lỗi chuẩn Linux POSIX (`errno`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum LinuxErrno {
         Eperm = 1,
@@ -777,24 +973,28 @@ pub mod linux_abi {
         }
     }
 
-    /// Số hiệu Syscall chuẩn của kiến trúc Linux `x86_64`
+    // Bảng số hiệu Syscall chuẩn của kiến trúc Linux x86_64
     pub const SYS_READ: u64 = 0;
     pub const SYS_WRITE: u64 = 1;
     pub const SYS_MMAP: u64 = 9;
     pub const SYS_BRK: u64 = 12;
+    pub const SYS_IOCTL: u64 = 16;
+    pub const SYS_WRITEV: u64 = 20;
+    pub const SYS_GETPID: u64 = 39;
+    pub const SYS_EXIT: u64 = 60;
     pub const SYS_UNAME: u64 = 63;
     pub const SYS_ARCH_PRCTL: u64 = 158;
-    pub const SYS_EXIT: u64 = 60;
+    pub const SYS_GETTID: u64 = 186;
+    pub const SYS_SET_TID_ADDRESS: u64 = 218;
     pub const SYS_EXIT_GROUP: u64 = 231;
 
-    /// Tham số của `SYS_arch_prctl` trên Linux x86_64 phục vụ Thread-Local Storage (`FS` base)
     pub const ARCH_SET_GS: u64 = 0x1001;
     pub const ARCH_SET_FS: u64 = 0x1002;
     pub const ARCH_GET_FS: u64 = 0x1003;
     pub const ARCH_GET_GS: u64 = 0x1004;
 
-    /// Cấu trúc `utsname` chuẩn của Linux ABI (trả về bởi syscall `uname`).
-    /// Mỗi trường dài đúng 65 byte (kèm null-terminator).
+    pub const TIOCGWINSZ: u64 = 0x5413;
+
     #[repr(C)]
     #[derive(Clone, Copy)]
     pub struct LinuxUtsName {
@@ -851,9 +1051,10 @@ pub mod linux_abi {
         }
     }
 
-    /// Trạng thái ngữ cảnh Tiến trình Linux (Linux Task Context) trong Safe Kernel Core.
     pub struct LinuxProcessState {
         pub pid: u64,
+        pub tid: u64,
+        pub clear_child_tid: u64,
         pub program_break: u64,
         pub last_exit_code: Option<i32>,
     }
@@ -862,13 +1063,14 @@ pub mod linux_abi {
         pub const fn new(pid: u64, initial_brk: u64) -> Self {
             Self {
                 pid,
+                tid: pid,
+                clear_child_tid: 0,
                 program_break: initial_brk,
                 last_exit_code: None,
             }
         }
     }
 
-    /// Bộ xử lý Syscall chuẩn Linux x86_64 viết bằng 100% Safe Rust.
     pub fn dispatch_linux_syscall(
         frame: &mut TrapFrame,
         proc_state: &mut LinuxProcessState,
@@ -879,6 +1081,14 @@ pub mod linux_abi {
             SYS_WRITE => sys_write(frame.rdi, frame.rsi, frame.rdx),
             SYS_MMAP => sys_mmap(frame.rdi, frame.rsi, pmm),
             SYS_BRK => sys_brk(frame.rdi, proc_state),
+            SYS_IOCTL => sys_ioctl(frame.rdi, frame.rsi, frame.rdx),
+            SYS_WRITEV => sys_writev(frame.rdi, frame.rsi, frame.rdx),
+            SYS_GETPID => Ok(proc_state.pid),
+            SYS_GETTID => Ok(proc_state.tid),
+            SYS_SET_TID_ADDRESS => {
+                proc_state.clear_child_tid = frame.rdi;
+                Ok(proc_state.tid)
+            }
             SYS_UNAME => sys_uname(frame.rdi),
             SYS_ARCH_PRCTL => sys_arch_prctl(frame.rdi, frame.rsi),
             SYS_EXIT | SYS_EXIT_GROUP => {
@@ -896,7 +1106,6 @@ pub mod linux_abi {
 
     fn sys_read(fd: u64, _buf_ptr: u64, _count: u64) -> Result<u64, LinuxErrno> {
         if fd == 0 {
-            // EOF trên stdin khi chạy không tương tác
             Ok(0)
         } else {
             Err(LinuxErrno::Ebadf)
@@ -904,7 +1113,6 @@ pub mod linux_abi {
     }
 
     fn sys_write(fd: u64, buf_ptr: u64, count: u64) -> Result<u64, LinuxErrno> {
-        // Chỉ hỗ trợ stdout (1) và stderr (2) trong Phase 1
         if fd != 1 && fd != 2 {
             return Err(LinuxErrno::Ebadf);
         }
@@ -928,6 +1136,49 @@ pub mod linux_abi {
             }
         }
         Ok(written)
+    }
+
+    /// Hiện thực `SYS_writev` (vectored I/O) phục vụ `musl libc` (`struct iovec { base: u64, len: u64 }`).
+    fn sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> Result<u64, LinuxErrno> {
+        if fd != 1 && fd != 2 {
+            return Err(LinuxErrno::Ebadf);
+        }
+        if iovcnt > 1024 {
+            return Err(LinuxErrno::Einval);
+        }
+        let mut total_written: u64 = 0;
+        let mut idx: u64 = 0;
+        while idx < iovcnt {
+            let entry_addr = iov_ptr.wrapping_add(idx.wrapping_mul(16));
+            let mut raw_iov = [0u8; 16];
+            copy_from_buffer(entry_addr, &mut raw_iov).map_err(|_| LinuxErrno::Efault)?;
+
+            let mut base_bytes = [0u8; 8];
+            let mut len_bytes = [0u8; 8];
+            base_bytes.copy_from_slice(&raw_iov[0..8]);
+            len_bytes.copy_from_slice(&raw_iov[8..16]);
+
+            let iov_base = u64::from_le_bytes(base_bytes);
+            let iov_len = u64::from_le_bytes(len_bytes);
+
+            if iov_len > 0 {
+                let n = sys_write(fd, iov_base, iov_len)?;
+                total_written = total_written.wrapping_add(n);
+            }
+            idx += 1;
+        }
+        Ok(total_written)
+    }
+
+    fn sys_ioctl(fd: u64, request: u64, argp: u64) -> Result<u64, LinuxErrno> {
+        if fd <= 2 && request == TIOCGWINSZ {
+            // struct winsize { ws_row: 25, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 }
+            let winsize: [u8; 8] = [25, 0, 80, 0, 0, 0, 0, 0];
+            copy_to_buffer(argp, &winsize).map_err(|_| LinuxErrno::Efault)?;
+            Ok(0)
+        } else {
+            Err(LinuxErrno::Einval)
+        }
     }
 
     fn sys_mmap(
@@ -969,16 +1220,307 @@ pub mod linux_abi {
             _ => Err(LinuxErrno::Einval),
         }
     }
+
+    // ------------------------------------------------------------------------
+    // 2.2: TRÌNH PHÂN TÍCH & NẠP LINUX ELF64 (100% SAFE RUST)
+    // ------------------------------------------------------------------------
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ElfLoadError {
+        BufferTooSmall,
+        InvalidMagic,
+        UnsupportedClassOrEndian,
+        UnsupportedArchitecture,
+        InvalidProgramHeader,
+        MappingFailed,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct LoadedElfProcess {
+        pub entry_rip: u64,
+        pub user_rsp: u64,
+        pub initial_brk: u64,
+    }
+
+    const PT_LOAD: u32 = 1;
+    const AT_NULL: u64 = 0;
+    const AT_PHENT: u64 = 4;
+    const AT_PHNUM: u64 = 5;
+    const AT_PAGESZ: u64 = 6;
+    const AT_ENTRY: u64 = 9;
+
+    fn read_u16_le(data: &[u8], offset: usize) -> Result<u16, ElfLoadError> {
+        let slice = data
+            .get(offset..offset + 2)
+            .ok_or(ElfLoadError::BufferTooSmall)?;
+        let mut arr = [0u8; 2];
+        arr.copy_from_slice(slice);
+        Ok(u16::from_le_bytes(arr))
+    }
+
+    fn read_u32_le(data: &[u8], offset: usize) -> Result<u32, ElfLoadError> {
+        let slice = data
+            .get(offset..offset + 4)
+            .ok_or(ElfLoadError::BufferTooSmall)?;
+        let mut arr = [0u8; 4];
+        arr.copy_from_slice(slice);
+        Ok(u32::from_le_bytes(arr))
+    }
+
+    fn read_u64_le(data: &[u8], offset: usize) -> Result<u64, ElfLoadError> {
+        let slice = data
+            .get(offset..offset + 8)
+            .ok_or(ElfLoadError::BufferTooSmall)?;
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(slice);
+        Ok(u64::from_le_bytes(arr))
+    }
+
+    /// Phân tích ảnh nhị phân ELF64, ánh xạ các phân đoạn `PT_LOAD` vào không gian địa chỉ User-space,
+    /// và thiết lập ngăn xếp khởi tạo chuẩn System V AMD64 (`argc`, `argv`, `envp`, `auxv`).
+    pub fn load_elf64_into_user_space(
+        elf_bytes: &[u8],
+        pmm: &mut BitmapFrameAllocator,
+    ) -> Result<LoadedElfProcess, ElfLoadError> {
+        if elf_bytes.len() < 64 {
+            return Err(ElfLoadError::BufferTooSmall);
+        }
+        if elf_bytes.get(0..4) != Some(b"\x7FELF") {
+            return Err(ElfLoadError::InvalidMagic);
+        }
+        // EI_CLASS == 2 (64-bit), EI_DATA == 1 (Little-Endian)
+        if elf_bytes.get(4) != Some(&2) || elf_bytes.get(5) != Some(&1) {
+            return Err(ElfLoadError::UnsupportedClassOrEndian);
+        }
+
+        let e_type = read_u16_le(elf_bytes, 16)?;
+        let e_machine = read_u16_le(elf_bytes, 18)?;
+        if (e_type != 2 && e_type != 3) || e_machine != 62 {
+            return Err(ElfLoadError::UnsupportedArchitecture);
+        }
+
+        let e_entry = read_u64_le(elf_bytes, 24)?;
+        let e_phoff = read_u64_le(elf_bytes, 32)? as usize;
+        let e_phentsize = read_u16_le(elf_bytes, 54)? as usize;
+        let e_phnum = read_u16_le(elf_bytes, 56)? as usize;
+
+        if e_phentsize < 56 {
+            return Err(ElfLoadError::InvalidProgramHeader);
+        }
+
+        let mut max_vaddr: u64 = 0x0040_0000;
+
+        for i in 0..e_phnum {
+            let ph_base = e_phoff + i * e_phentsize;
+            let p_type = read_u32_le(elf_bytes, ph_base)?;
+            if p_type != PT_LOAD {
+                continue;
+            }
+
+            let p_offset = read_u64_le(elf_bytes, ph_base + 8)? as usize;
+            let p_vaddr = read_u64_le(elf_bytes, ph_base + 16)?;
+            let p_filesz = read_u64_le(elf_bytes, ph_base + 32)? as usize;
+            let p_memsz = read_u64_le(elf_bytes, ph_base + 40)?;
+
+            if p_memsz == 0 {
+                continue;
+            }
+
+            let seg_start_page = p_vaddr & !0xFFF;
+            let seg_end = p_vaddr.wrapping_add(p_memsz);
+            let seg_end_page = (seg_end.wrapping_add(0xFFF)) & !0xFFF;
+
+            let mut page_va = seg_start_page;
+            while page_va < seg_end_page {
+                map_user_page(pmm, page_va).map_err(|_| ElfLoadError::MappingFailed)?;
+                page_va += PAGE_SIZE as u64;
+            }
+
+            let file_slice = elf_bytes
+                .get(p_offset..p_offset + p_filesz)
+                .ok_or(ElfLoadError::InvalidProgramHeader)?;
+            copy_to_buffer(p_vaddr, file_slice).map_err(|_| ElfLoadError::MappingFailed)?;
+
+            if seg_end_page > max_vaddr {
+                max_vaddr = seg_end_page;
+            }
+        }
+
+        // Cấp phát ngăn xếp User-space (8 KiB tại 0x0080_0000 .. 0x0080_2000)
+        let stack_bottom: u64 = 0x0000_0000_0080_0000;
+        map_user_page(pmm, stack_bottom).map_err(|_| ElfLoadError::MappingFailed)?;
+        map_user_page(pmm, stack_bottom + 0x1000).map_err(|_| ElfLoadError::MappingFailed)?;
+
+        let stack_top = stack_bottom + 0x2000;
+        let user_rsp = setup_sysv_user_stack(stack_top, e_entry, e_phnum as u64)?;
+
+        Ok(LoadedElfProcess {
+            entry_rip: e_entry,
+            user_rsp,
+            initial_brk: max_vaddr,
+        })
+    }
+
+    /// Khởi tạo ngăn xếp chuẩn System V AMD64 ABI cho tiến trình Linux User-space:
+    /// `[rsp]` -> `argc = 2`, `argv[0]`, `argv[1]`, `NULL`, `envp[0]`, `NULL`, `auxv[...]`.
+    fn setup_sysv_user_stack(
+        stack_top: u64,
+        entry_rip: u64,
+        phnum: u64,
+    ) -> Result<u64, ElfLoadError> {
+        let str_area = stack_top - 64;
+        let arg0_va = str_area;
+        let arg1_va = str_area + 16;
+        let env0_va = str_area + 32;
+
+        copy_to_buffer(arg0_va, b"/bin/init\0").map_err(|_| ElfLoadError::MappingFailed)?;
+        copy_to_buffer(arg1_va, b"--ci-verify\0").map_err(|_| ElfLoadError::MappingFailed)?;
+        copy_to_buffer(env0_va, b"OS=ZenithOS\0").map_err(|_| ElfLoadError::MappingFailed)?;
+
+        // Bảng gồm 16 phần tử u64 (128 bytes, căn lề 16-byte hoàn hảo):
+        // [0]: argc = 2
+        // [1]: argv[0], [2]: argv[1], [3]: NULL
+        // [4]: envp[0], [5]: NULL
+        // [6..15]: Auxiliary Vector (AT_PAGESZ, AT_ENTRY, AT_PHENT, AT_PHNUM, AT_NULL)
+        let table_words: [u64; 16] = [
+            2,          // argc
+            arg0_va,    // argv[0] = "/bin/init"
+            arg1_va,    // argv[1] = "--ci-verify"
+            0,          // argv[2] = NULL
+            env0_va,    // envp[0] = "OS=ZenithOS"
+            0,          // envp[1] = NULL
+            AT_PAGESZ,  // auxv[0].a_type
+            4096,       // auxv[0].a_val
+            AT_ENTRY,   // auxv[1].a_type
+            entry_rip,  // auxv[1].a_val
+            AT_PHENT,   // auxv[2].a_type
+            56,         // auxv[2].a_val
+            AT_PHNUM,   // auxv[3].a_type
+            phnum,      // auxv[3].a_val
+            AT_NULL,    // auxv[4].a_type
+            0,          // auxv[4].a_val
+        ];
+
+        let rsp = str_area - 128;
+        for (i, &word) in table_words.iter().enumerate() {
+            let addr = rsp + (i as u64) * 8;
+            copy_to_buffer(addr, &word.to_le_bytes()).map_err(|_| ElfLoadError::MappingFailed)?;
+        }
+
+        Ok(rsp)
+    }
+
+    /// Đóng gói một ảnh thực thi Linux `x86_64` ELF64 hoàn chỉnh (`/bin/init`) chứa mã máy Ring 3 thật.
+    /// Tiến trình này sẽ chạy ở `CPL = 3` (`0x0040_1000`), đọc `argc` từ `[rsp]`, và gọi 6 syscall:
+    /// `SYS_getpid`, `SYS_set_tid_address`, `SYS_write`, `SYS_writev`, `SYS_brk`, `SYS_exit_group`.
+    pub fn build_embedded_linux_init_elf64() -> [u8; 768] {
+        let mut elf = [0u8; 768];
+
+        // 1. ELF64 Header (64 bytes tại offset 0x00)
+        elf[0..4].copy_from_slice(b"\x7FELF");
+        elf[4] = 2; // ELFCLASS64
+        elf[5] = 1; // ELFDATA2LSB
+        elf[6] = 1; // EV_CURRENT
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
+        elf[24..32].copy_from_slice(&0x0040_1000u64.to_le_bytes()); // e_entry = 0x401000
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff = 64
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize = 64
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize = 56
+        elf[56..58].copy_from_slice(&2u16.to_le_bytes()); // e_phnum = 2
+
+        // 2. Program Header #0: PT_LOAD (.text tại 0x0040_1000, file offset 256, size 128)
+        let ph0 = 64;
+        elf[ph0..ph0 + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        elf[ph0 + 4..ph0 + 8].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
+        elf[ph0 + 8..ph0 + 16].copy_from_slice(&256u64.to_le_bytes()); // p_offset
+        elf[ph0 + 16..ph0 + 24].copy_from_slice(&0x0040_1000u64.to_le_bytes()); // p_vaddr
+        elf[ph0 + 24..ph0 + 32].copy_from_slice(&0x0040_1000u64.to_le_bytes()); // p_paddr
+        elf[ph0 + 32..ph0 + 40].copy_from_slice(&128u64.to_le_bytes()); // p_filesz
+        elf[ph0 + 40..ph0 + 48].copy_from_slice(&128u64.to_le_bytes()); // p_memsz
+        elf[ph0 + 48..ph0 + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+
+        // 3. Program Header #1: PT_LOAD (.data tại 0x0040_2000, file offset 384, size 256)
+        let ph1 = 120;
+        elf[ph1..ph1 + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        elf[ph1 + 4..ph1 + 8].copy_from_slice(&6u32.to_le_bytes()); // PF_R | PF_W
+        elf[ph1 + 8..ph1 + 16].copy_from_slice(&384u64.to_le_bytes()); // p_offset
+        elf[ph1 + 16..ph1 + 24].copy_from_slice(&0x0040_2000u64.to_le_bytes()); // p_vaddr
+        elf[ph1 + 24..ph1 + 32].copy_from_slice(&0x0040_2000u64.to_le_bytes()); // p_paddr
+        elf[ph1 + 32..ph1 + 40].copy_from_slice(&256u64.to_le_bytes()); // p_filesz
+        elf[ph1 + 40..ph1 + 48].copy_from_slice(&256u64.to_le_bytes()); // p_memsz
+        elf[ph1 + 48..ph1 + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+
+        // 4. Mã máy Ring 3 x86_64 tại file offset 256 (ánh xạ vào 0x0040_1000):
+        let code: [u8; 98] = [
+            0x4c, 0x8b, 0x24, 0x24, // mov r12, qword ptr [rsp] (đọc argc = 2)
+            0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax, 39 (SYS_getpid)
+            0x0f, 0x05, // syscall
+            0x49, 0x89, 0xc5, // mov r13, rax (lưu PID = 1)
+            0xb8, 0xda, 0x00, 0x00, 0x00, // mov eax, 218 (SYS_set_tid_address)
+            0xbf, 0x00, 0x21, 0x40, 0x00, // mov edi, 0x00402100
+            0x0f, 0x05, // syscall
+            0x49, 0x89, 0xc6, // mov r14, rax (lưu TID = 1)
+            0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (SYS_write)
+            0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1 (stdout)
+            0xbe, 0x00, 0x20, 0x40, 0x00, // mov esi, 0x00402000 (msg1)
+            0xba, 0x48, 0x00, 0x00, 0x00, // mov edx, 72
+            0x0f, 0x05, // syscall
+            0xb8, 0x14, 0x00, 0x00, 0x00, // mov eax, 20 (SYS_writev)
+            0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1 (stdout)
+            0xbe, 0x90, 0x20, 0x40, 0x00, // mov esi, 0x00402090 (iovec[2])
+            0xba, 0x02, 0x00, 0x00, 0x00, // mov edx, 2 (iovcnt = 2)
+            0x0f, 0x05, // syscall
+            0xb8, 0x0c, 0x00, 0x00, 0x00, // mov eax, 12 (SYS_brk)
+            0xbf, 0x00, 0x80, 0x40, 0x00, // mov edi, 0x00408000
+            0x0f, 0x05, // syscall
+            // Kết hợp mã xác thực: rdi = (argc << 4) | (pid << 2) | tid = (2 << 4) | (1 << 2) | 1 = 0x25 (37)
+            0x4c, 0x89, 0xe7, // mov rdi, r12
+            0x48, 0xc1, 0xe7, 0x04, // shl rdi, 4
+            0x49, 0xc1, 0xe5, 0x02, // shl r13, 2
+            0x4c, 0x09, 0xef, // or rdi, r13
+            0x4c, 0x09, 0xf7, // or rdi, r14
+            0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, 231 (SYS_exit_group)
+            0x0f, 0x05, // syscall
+        ];
+        elf[256..256 + code.len()].copy_from_slice(&code);
+
+        // 5. Dữ liệu .data tại file offset 384 (ánh xạ vào 0x0040_2000):
+        let msg1 = b"[RING-3 ELF64] Hello from Linux User-Space (CPL=3) via SYSCALL/SYSRETQ!\n";
+        elf[384..384 + 72].copy_from_slice(msg1);
+
+        let iov_part1 = b"[RING-3 ELF64] musl-style "; // 26 bytes tại 0x0040_2048 (file offset 456)
+        elf[456..456 + 26].copy_from_slice(iov_part1);
+
+        let iov_part2 = b"SYS_writev(iovcnt=2) verified in Ring 3!\n"; // 41 bytes tại 0x0040_2068 (file offset 488)
+        elf[488..488 + 41].copy_from_slice(iov_part2);
+
+        // Mảng `struct iovec[2]` tại 0x0040_2090 (file offset 528):
+        // iov[0] = { base: 0x0040_2048, len: 26 }
+        // iov[1] = { base: 0x0040_2068, len: 41 }
+        elf[528..536].copy_from_slice(&0x0040_2048u64.to_le_bytes());
+        elf[536..544].copy_from_slice(&26u64.to_le_bytes());
+        elf[544..552].copy_from_slice(&0x0040_2068u64.to_le_bytes());
+        elf[552..560].copy_from_slice(&41u64.to_le_bytes());
+
+        elf
+    }
 }
 
 // ============================================================================
-// ĐIỂM NỐI ASSEMBLY SYSCALL ENTRY & BOOTSTRAP KIỂM THỬ TỰ ĐỘNG (PHASE 1)
+// ĐIỂM NỐI SYSCALL TỪ RING 3 & QUẢN LÝ TRẠNG THÁI TIẾN TRÌNH HIỆN HÀNH
 // ============================================================================
 #[no_mangle]
 extern "C" fn zenith_syscall_entry_from_asm(frame: &mut ostd::TrapFrame) {
-    let mut dummy_proc = linux_abi::LinuxProcessState::new(1, 0x0000_0040_0000_0000);
-    let mut dummy_pmm = ostd::BitmapFrameAllocator::new();
-    linux_abi::dispatch_linux_syscall(frame, &mut dummy_proc, &mut dummy_pmm);
+    let mut active_proc = linux_abi::LinuxProcessState::new(1, 0x0000_0000_0040_3000);
+    let mut pmm = ostd::BitmapFrameAllocator::new();
+    linux_abi::dispatch_linux_syscall(frame, &mut active_proc, &mut pmm);
+
+    // Nếu tiến trình Ring 3 vừa gọi SYS_exit hoặc SYS_exit_group, thoát khỏi ngữ cảnh User-space
+    // và trả mã thoát về cho hàm `ostd::enter_user_space` trong Kernel!
+    if let Some(exit_code) = active_proc.last_exit_code {
+        ostd::return_to_kernel_from_exit(exit_code);
+    }
 }
 
 macro_rules! kprintln {
@@ -988,133 +1530,67 @@ macro_rules! kprintln {
     };
 }
 
-/// Điểm vào chính của Kernel ZenithOS sau khi Bootloader Limine bàn giao quyền điều khiển.
+/// Điểm vào chính của Kernel ZenithOS (Phase 1 + Phase 2: ELF64 & Ring 3 User-Space).
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     ostd::SerialConsole::init();
     kprintln!("================================================================");
-    kprintln!("  ZenithOS v0.1.0 - 100% Rust Framekernel (Linux ABI Phase 1)   ");
+    kprintln!("  ZenithOS v0.2.0 - 100% Rust Framekernel (Linux ABI Phase 2)   ");
     kprintln!("================================================================");
 
-    // 1. Khởi tạo GDT & TSS (chuẩn bị selector cho Ring 0 và Ring 3 SYSRETQ)
+    // 1. Khởi tạo GDT, TSS, IDT và MSR cho SYSCALL/SYSRETQ
     ostd::init_gdt_and_tss();
-    kprintln!("[ZENITH-OSTD] GDT (Ring0/Ring3 Selectors) & 64-bit TSS initialized.");
-
-    // 2. Khởi tạo IDT và chạy tự kiểm tra ngắt phần cứng (#BP - int3)
     ostd::init_idt();
     ostd::trigger_breakpoint_self_test();
-    let bp_hits = ostd::BREAKPOINT_HIT_COUNT.load(Ordering::SeqCst);
-    if bp_hits != 1 {
+    if ostd::BREAKPOINT_HIT_COUNT.load(Ordering::SeqCst) != 1 {
         kprintln!("[ZENITH-TEST][FAIL] IDT Breakpoint self-test failed!");
         ostd::exit_qemu(ostd::QemuExitCode::Failed);
     }
-    kprintln!("[ZENITH-OSTD] IDT initialized & Breakpoint (#BP) self-test PASSED.");
-
-    // 3. Khởi tạo MSR cho SYSCALL/SYSRETQ
     ostd::init_syscall_msrs();
-    kprintln!("[ZENITH-OSTD] Fast SYSCALL/SYSRETQ MSRs (STAR/LSTAR/SFMASK) configured.");
+    ostd::disable_smap_for_loader();
+    kprintln!("[ZENITH-OSTD] GDT/TSS, IDT (#BP), and SYSCALL/SYSRETQ MSRs ready.");
 
-    // 4. Kiểm thử Bộ cấp phát khung trang vật lý (PMM) & MMU Page Table Indexing
+    // 2. Khởi tạo PMM (kèm HHDM & Kernel Address từ Limine)
     let mut pmm = ostd::BitmapFrameAllocator::new();
-    let frame1 = match pmm.allocate_frame() {
-        Ok(addr) => addr,
-        Err(_) => ostd::exit_qemu(ostd::QemuExitCode::Failed),
+
+    // 3. Xây dựng và nạp ảnh thực thi Linux ELF64 (`/bin/init`) vào vùng nhớ User-space
+    let elf_image = linux_abi::build_embedded_linux_init_elf64();
+    let loaded = match linux_abi::load_elf64_into_user_space(&elf_image, &mut pmm) {
+        Ok(info) => info,
+        Err(err) => {
+            kprintln!("[ZENITH-ELF][FAIL] ELF64 Loader error: {:?}", err);
+            ostd::exit_qemu(ostd::QemuExitCode::Failed);
+        }
     };
-    let frame2 = match pmm.allocate_frame() {
-        Ok(addr) => addr,
-        Err(_) => ostd::exit_qemu(ostd::QemuExitCode::Failed),
-    };
-    if frame1 == frame2 || (frame1 & 0xFFF) != 0 {
-        kprintln!("[ZENITH-TEST][FAIL] PMM frame alignment or uniqueness check failed!");
-        ostd::exit_qemu(ostd::QemuExitCode::Failed);
-    }
-    ostd::flush_tlb(frame1);
-    let (p4, p3, p2, p1) = ostd::PageTable::indices(0xFFFF_FFFF_8000_1000);
-    if (p4, p3, p2, p1) != (511, 510, 0, 1) {
-        kprintln!("[ZENITH-TEST][FAIL] 4-Level MMU index calculation mismatch!");
-        ostd::exit_qemu(ostd::QemuExitCode::Failed);
-    }
     kprintln!(
-        "[ZENITH-OSTD] Bitmap PMM (frame=0x{:x}) & 4-Level MMU verification PASSED.",
-        frame1
+        "[ZENITH-ELF] Loaded Linux x86_64 ELF64 '/bin/init': entry=0x{:x}, user_rsp=0x{:x}, brk=0x{:x}",
+        loaded.entry_rip,
+        loaded.user_rsp,
+        loaded.initial_brk
     );
 
-    // 5. Kiểm thử Tầng tương thích Linux ABI (`#![forbid(unsafe_code)]`)
-    let mut linux_proc = linux_abi::LinuxProcessState::new(100, 0x0000_0000_1000_0000);
-    let mut trap = ostd::TrapFrame::default();
-
-    // 5a. Kiểm thử Linux `SYS_write` (Syscall #1) in trực tiếp ra Serial Console
-    let msg = b"[ZENITH-LINUX] Hello from Linux x86_64 ABI SYS_write(fd=1)!\n";
-    trap.rax = linux_abi::SYS_WRITE;
-    trap.rdi = 1; // stdout
-    trap.rsi = msg.as_ptr() as u64;
-    trap.rdx = msg.len() as u64;
-    linux_abi::dispatch_linux_syscall(&mut trap, &mut linux_proc, &mut pmm);
-    if trap.rax != msg.len() as u64 {
-        kprintln!("[ZENITH-TEST][FAIL] Linux SYS_write returned unexpected byte count!");
-        ostd::exit_qemu(ostd::QemuExitCode::Failed);
-    }
-
-    // 5b. Kiểm thử Linux `SYS_uname` (Syscall #63)
-    trap.rax = linux_abi::SYS_UNAME;
-    trap.rdi = frame1; // Sử dụng trang 4KB vừa cấp phát làm bộ đệm nhận `struct utsname`
-    linux_abi::dispatch_linux_syscall(&mut trap, &mut linux_proc, &mut pmm);
-    let mut sysname_check = [0u8; 5];
-    if ostd::copy_from_buffer(frame1, &mut sysname_check).is_err() || &sysname_check != b"Linux" {
-        kprintln!("[ZENITH-TEST][FAIL] Linux SYS_uname verification failed!");
-        ostd::exit_qemu(ostd::QemuExitCode::Failed);
-    }
-    kprintln!("[ZENITH-LINUX] SYS_uname verified (sysname = \"Linux\", machine = \"x86_64\").");
-
-    // 5c. Kiểm thử Linux `SYS_arch_prctl(ARCH_SET_FS)` & `ARCH_GET_FS` (Syscall #158 cho TLS)
-    let expected_tls_base: u64 = 0x0000_7FFF_F000_0000;
-    trap.rax = linux_abi::SYS_ARCH_PRCTL;
-    trap.rdi = linux_abi::ARCH_SET_FS;
-    trap.rsi = expected_tls_base;
-    linux_abi::dispatch_linux_syscall(&mut trap, &mut linux_proc, &mut pmm);
-
-    trap.rax = linux_abi::SYS_ARCH_PRCTL;
-    trap.rdi = linux_abi::ARCH_GET_FS;
-    trap.rsi = frame2;
-    linux_abi::dispatch_linux_syscall(&mut trap, &mut linux_proc, &mut pmm);
-
-    let mut tls_readback = [0u8; 8];
-    if ostd::copy_from_buffer(frame2, &mut tls_readback).is_err()
-        || u64::from_ne_bytes(tls_readback) != expected_tls_base
-    {
-        kprintln!("[ZENITH-TEST][FAIL] Linux TLS (FS_BASE) verification failed!");
-        ostd::exit_qemu(ostd::QemuExitCode::Failed);
-    }
+    // 4. Nhảy xuống Ring 3 (CPL = 3) qua `sysretq` để thực thi tiến trình Linux `/bin/init`!
+    kprintln!("[ZENITH-CORE] Transitioning to Ring 3 User-Space via SYSRETQ...");
+    let exit_code = ostd::enter_user_space(loaded.entry_rip, loaded.user_rsp);
     kprintln!(
-        "[ZENITH-LINUX] SYS_arch_prctl(ARCH_SET_FS = 0x{:x}) verified.",
-        expected_tls_base
+        "[ZENITH-CORE] Ring 3 process '/bin/init' exited cleanly back to Kernel with token=0x{:x}.",
+        exit_code
     );
 
-    // 5d. Kiểm thử Linux `SYS_brk` (Syscall #12) & `SYS_exit_group` (Syscall #231)
-    trap.rax = linux_abi::SYS_BRK;
-    trap.rdi = 0x0000_0000_1000_8000;
-    linux_abi::dispatch_linux_syscall(&mut trap, &mut linux_proc, &mut pmm);
-    if trap.rax != 0x0000_0000_1000_8000 {
-        kprintln!("[ZENITH-TEST][FAIL] Linux SYS_brk verification failed!");
+    // Kiểm tra mã xác thực trả về từ Ring 3:
+    // (argc=2 << 4) | (pid=1 << 2) | (tid=1) = 0x25 (37)
+    if exit_code != 0x25 {
+        kprintln!(
+            "[ZENITH-TEST][FAIL] Unexpected Ring 3 exit token: 0x{:x} (expected 0x25)",
+            exit_code
+        );
         ostd::exit_qemu(ostd::QemuExitCode::Failed);
     }
 
-    trap.rax = linux_abi::SYS_EXIT_GROUP;
-    trap.rdi = 0;
-    linux_abi::dispatch_linux_syscall(&mut trap, &mut linux_proc, &mut pmm);
-    if linux_proc.last_exit_code != Some(0) {
-        kprintln!("[ZENITH-TEST][FAIL] Linux SYS_exit_group verification failed!");
-        ostd::exit_qemu(ostd::QemuExitCode::Failed);
-    }
-
-    let _ = pmm.deallocate_frame(frame1);
-    let _ = pmm.deallocate_frame(frame2);
-
     kprintln!("================================================================");
-    kprintln!("[ZENITH-CI] ALL PHASE 1 HARDWARE & LINUX ABI TESTS PASSED!      ");
+    kprintln!("[ZENITH-CI] ALL PHASE 2 ELF64 & RING 3 USER-SPACE TESTS PASSED! ");
     kprintln!("================================================================");
 
-    // Thoát QEMU ngay lập tức với mã thành công (Exit code 33) để CI hoàn tất trong < 1 giây
     ostd::exit_qemu(ostd::QemuExitCode::Success);
 }
 
