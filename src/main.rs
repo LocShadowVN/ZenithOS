@@ -1,9 +1,10 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
+#![allow(clippy::fn_to_numeric_cast)]
 
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 
 // ============================================================================
 // GIAO THỨC KHỞI ĐỘNG LIMINE (LIMINE BOOT PROTOCOL)
@@ -29,7 +30,7 @@ pub mod boot_protocol {
     #[link_section = ".requests_start_marker"]
     pub static REQUESTS_START_MARKER: [u64; 4] = [
         0xf6b8_f4b3_9de7_d1ae,
-        0xfab9_1a69_40fcb_9cf,
+        0xfab9_1a69_40fc_b9cf,
         0x785c_6ed0_15d3_e316,
         0x181e_920a_7852_b9d9,
     ];
@@ -236,15 +237,17 @@ pub mod ostd {
     pub fn init_gdt_and_tss() {
         // SAFETY:
         // Hàm này được gọi duy nhất 1 lần trên BSP (Bootstrap Processor) trong quá trình khởi động
-        // đơn luồng trước khi bật ngắt. Không có truy cập đồng thời (aliasing) tới `TSS` và `GDT`.
+        // đơn luồng trước khi bật ngắt. Truy cập qua con trỏ thô `&raw mut` đảm bảo không vi phạm
+        // quy tắc aliasing của Rust.
         unsafe {
             let rsp0_top = (&raw const KERNEL_INTR_STACK.0 as u64) + 16384;
             let ist1_top = (&raw const DOUBLE_FAULT_IST_STACK.0 as u64) + 16384;
 
-            TSS.privilege_stack_table[0] = rsp0_top;
-            TSS.interrupt_stack_table[0] = ist1_top;
+            let tss_ptr = &raw mut TSS;
+            (*tss_ptr).privilege_stack_table[0] = rsp0_top;
+            (*tss_ptr).interrupt_stack_table[0] = ist1_top;
 
-            let tss_base = &raw const TSS as u64;
+            let tss_base = tss_ptr as u64;
             let tss_limit = (core::mem::size_of::<TaskStateSegment>() - 1) as u64;
 
             let mut tss_low: u64 = 0;
@@ -256,12 +259,13 @@ pub mod ostd {
 
             let tss_high: u64 = tss_base >> 32;
 
-            GDT.entries[5] = tss_low;
-            GDT.entries[6] = tss_high;
+            let gdt_ptr = &raw mut GDT;
+            (*gdt_ptr).entries[5] = tss_low;
+            (*gdt_ptr).entries[6] = tss_high;
 
             let gdtr = DescriptorTablePointer {
                 limit: (core::mem::size_of::<GdtTable>() - 1) as u16,
-                base: &raw const GDT as u64,
+                base: gdt_ptr as u64,
             };
 
             asm!(
@@ -383,19 +387,17 @@ pub mod ostd {
         "pop rcx",
         "pop rax",
         "iretq",
-
         ".global isr_double_fault_stub",
         "isr_double_fault_stub:",
-        "mov rdi, 8",           // Vector #8 (#DF)
-        "pop rsi",              // Error code do CPU đẩy vào stack
-        "mov rdx, [rsp]",       // RIP gây lỗi
+        "mov rdi, 8",     // Vector #8 (#DF)
+        "pop rsi",        // Error code do CPU đẩy vào stack
+        "mov rdx, [rsp]", // RIP gây lỗi
         "call zenith_unhandled_exception",
-
         ".global isr_page_fault_stub",
         "isr_page_fault_stub:",
-        "mov rdi, 14",          // Vector #14 (#PF)
-        "pop rsi",              // Error code
-        "mov rdx, [rsp]",       // RIP gây lỗi
+        "mov rdi, 14",    // Vector #14 (#PF)
+        "pop rsi",        // Error code
+        "mov rdx, [rsp]", // RIP gây lỗi
         "call zenith_unhandled_exception",
     );
 
@@ -410,13 +412,17 @@ pub mod ostd {
         // Chỉ chạy 1 lần lúc khởi tạo hệ thống trên BSP. Các hàm stub assembly tuân thủ đúng
         // giao thức lưu/khôi phục thanh ghi và kết thúc bằng `iretq`.
         unsafe {
-            IDT.entries[3] = IdtEntry::new_handler(isr_breakpoint_stub as *const () as u64, 0);
-            IDT.entries[8] = IdtEntry::new_handler(isr_double_fault_stub as *const () as u64, 1); // IST1
-            IDT.entries[14] = IdtEntry::new_handler(isr_page_fault_stub as *const () as u64, 0);
+            let idt_ptr = &raw mut IDT;
+            (*idt_ptr).entries[3] =
+                IdtEntry::new_handler(isr_breakpoint_stub as *const () as u64, 0);
+            (*idt_ptr).entries[8] =
+                IdtEntry::new_handler(isr_double_fault_stub as *const () as u64, 1); // IST1
+            (*idt_ptr).entries[14] =
+                IdtEntry::new_handler(isr_page_fault_stub as *const () as u64, 0);
 
             let idtr = DescriptorTablePointer {
                 limit: (core::mem::size_of::<IdtTable>() - 1) as u16,
-                base: &raw const IDT as u64,
+                base: idt_ptr as u64,
             };
 
             asm!("lidt [{}]", in(reg) &idtr, options(nostack, preserves_flags));
@@ -446,6 +452,12 @@ pub mod ostd {
     pub struct BitmapFrameAllocator {
         bitmap: [u64; 4], // 4 * 64 = 256 frames
         base_addr: u64,
+    }
+
+    impl Default for BitmapFrameAllocator {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl BitmapFrameAllocator {
@@ -680,8 +692,9 @@ pub mod ostd {
         // Chỉ chạy 1 lần trên BSP. Thiết lập `BSP_PER_CPU` và các MSR `EFER`, `STAR`, `LSTAR`, `SFMASK`.
         unsafe {
             let kstack_top = (&raw const KERNEL_INTR_STACK.0 as u64) + 16384;
-            BSP_PER_CPU.kernel_rsp = kstack_top;
-            let per_cpu_addr = &raw const BSP_PER_CPU as u64;
+            let per_cpu_ptr = &raw mut BSP_PER_CPU;
+            (*per_cpu_ptr).kernel_rsp = kstack_top;
+            let per_cpu_addr = per_cpu_ptr as u64;
 
             write_msr(Msr::Ia32GsBase, per_cpu_addr);
             write_msr(Msr::Ia32KernelGsBase, per_cpu_addr);
@@ -698,7 +711,10 @@ pub mod ostd {
         write_msr(Msr::Ia32Star, star);
 
         // Cấu hình IA32_LSTAR trỏ tới `zenith_syscall_trampoline`
-        write_msr(Msr::Ia32Lstar, zenith_syscall_trampoline as *const () as u64);
+        write_msr(
+            Msr::Ia32Lstar,
+            zenith_syscall_trampoline as *const () as u64,
+        );
 
         // Xóa cờ IF (0x200) và DF (0x400) khi nhảy vào Ring 0
         write_msr(Msr::Ia32SfMask, 0x0600);
@@ -812,17 +828,12 @@ pub mod linux_abi {
         }
 
         fn fill_field(dst: &mut [u8; 65], src: &[u8]) {
-            let max_len = if src.len() < 64 { src.len() } else { 64 };
-            let mut i = 0;
-            while i < max_len {
-                if let (Some(d), Some(&s)) = (dst.get_mut(i), src.get(i)) {
-                    *d = s;
-                }
-                i += 1;
+            for (d, &s) in dst.iter_mut().take(64).zip(src.iter()) {
+                *d = s;
             }
         }
 
-        pub fn as_bytes(&self) -> [u8; 390] {
+        pub fn to_bytes(self) -> [u8; 390] {
             let mut out = [0u8; 390];
             Self::copy_slice(&mut out, 0, &self.sysname);
             Self::copy_slice(&mut out, 65, &self.nodename);
@@ -834,12 +845,10 @@ pub mod linux_abi {
         }
 
         fn copy_slice(dst: &mut [u8; 390], offset: usize, src: &[u8; 65]) {
-            let mut i = 0;
-            while i < 65 {
-                if let (Some(d), Some(&s)) = (dst.get_mut(offset + i), src.get(i)) {
+            if let Some(sub) = dst.get_mut(offset..offset + 65) {
+                for (d, &s) in sub.iter_mut().zip(src.iter()) {
                     *d = s;
                 }
-                i += 1;
             }
         }
     }
@@ -909,11 +918,7 @@ pub mod linux_abi {
 
         while written < count {
             let remaining = (count - written) as usize;
-            let chunk_len = if remaining < temp_buf.len() {
-                remaining
-            } else {
-                temp_buf.len()
-            };
+            let chunk_len = remaining.min(temp_buf.len());
 
             if let Some(slice) = temp_buf.get_mut(..chunk_len) {
                 copy_from_buffer(buf_ptr.wrapping_add(written), slice)
@@ -927,7 +932,11 @@ pub mod linux_abi {
         Ok(written)
     }
 
-    fn sys_mmap(_addr_hint: u64, length: u64, pmm: &mut BitmapFrameAllocator) -> Result<u64, LinuxErrno> {
+    fn sys_mmap(
+        _addr_hint: u64,
+        length: u64,
+        pmm: &mut BitmapFrameAllocator,
+    ) -> Result<u64, LinuxErrno> {
         if length == 0 || length > 4096 {
             return Err(LinuxErrno::Einval);
         }
@@ -943,7 +952,7 @@ pub mod linux_abi {
 
     fn sys_uname(uts_ptr: u64) -> Result<u64, LinuxErrno> {
         let uts = LinuxUtsName::zenith_default();
-        let raw_bytes = uts.as_bytes();
+        let raw_bytes = uts.to_bytes();
         copy_to_buffer(uts_ptr, &raw_bytes).map_err(|_| LinuxErrno::Efault)?;
         Ok(0)
     }
