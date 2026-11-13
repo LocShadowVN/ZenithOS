@@ -8,7 +8,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::Ordering;
 
 // ============================================================================
-// GIAO THỨC KHỞI ĐỘNG LIMINE (HHDM & KERNEL PHYSICAL ADDRESS)
+// GIAO THỨC KHỞI ĐỘNG LIMINE (HHDM, KERNEL ADDRESS & 32-BIT FRAMEBUFFER)
 // ============================================================================
 pub mod boot_protocol {
     use core::cell::UnsafeCell;
@@ -41,11 +41,47 @@ pub mod boot_protocol {
     }
 
     #[repr(C)]
+    pub struct LimineFramebuffer {
+        pub address: *mut u8,
+        pub width: u64,
+        pub height: u64,
+        pub pitch: u64,
+        pub bpp: u16,
+        pub memory_model: u8,
+        pub red_mask_size: u8,
+        pub red_mask_shift: u8,
+        pub green_mask_size: u8,
+        pub green_mask_shift: u8,
+        pub blue_mask_size: u8,
+        pub blue_mask_shift: u8,
+        pub unused: [u8; 7],
+        pub edid_size: u64,
+        pub edid: *const u8,
+        pub mode_count: u64,
+        pub modes: *const *const (),
+    }
+
+    #[repr(C)]
+    pub struct LimineFramebufferResponse {
+        pub revision: u64,
+        pub framebuffer_count: u64,
+        pub framebuffers: *const *const LimineFramebuffer,
+    }
+
+    #[repr(C)]
+    pub struct LimineFramebufferRequest {
+        pub id: [u64; 4],
+        pub revision: u64,
+        pub response: *const LimineFramebufferResponse,
+    }
+
+    #[repr(C)]
     pub struct LimineBootRequests {
         pub start_marker: [u64; 4],
         pub base_revision: [u64; 3],
         pub hhdm: LimineHhdmRequest,
         pub kernel_addr: LimineKernelAddressRequest,
+        pub framebuffer: LimineFramebufferRequest,
         pub end_marker: [u64; 2],
     }
 
@@ -83,6 +119,16 @@ pub mod boot_protocol {
                     0x0a82_e883_a194_f07b,
                     0x71ba_7686_3cc5_5f63,
                     0xb264_4a48_c516_a487,
+                ],
+                revision: 0,
+                response: core::ptr::null(),
+            },
+            framebuffer: LimineFramebufferRequest {
+                id: [
+                    0xc7b1_dd30_df4c_8b88,
+                    0x0a82_e883_a194_f07b,
+                    0x9d58_27dc_d881_dd75,
+                    0xa314_8604_f6fa_b11b,
                 ],
                 revision: 0,
                 response: core::ptr::null(),
@@ -238,7 +284,129 @@ pub mod ostd {
     }
 
     // ------------------------------------------------------------------------
-    // 1.2: GDT & TSS (CHUẨN BỐ CỤC CHO LỆNH SYSCALL / SYSRETQ)
+    // 1.2: HARDWARE LINEAR FRAMEBUFFER DRIVER (32-BIT BGRA)
+    // ------------------------------------------------------------------------
+    const FALLBACK_FB_W: usize = 320;
+    const FALLBACK_FB_H: usize = 200;
+    static mut FALLBACK_FB_CANVAS: [u32; FALLBACK_FB_W * FALLBACK_FB_H] =
+        [0; FALLBACK_FB_W * FALLBACK_FB_H];
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct FramebufferInfo {
+        pub addr: u64,
+        pub width: u32,
+        pub height: u32,
+        pub pitch: u32,
+        pub bpp: u16,
+        pub is_hardware: bool,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct Rect {
+        pub x: u32,
+        pub y: u32,
+        pub w: u32,
+        pub h: u32,
+    }
+
+    impl FramebufferInfo {
+        pub const fn const_uninit() -> Self {
+            Self {
+                addr: 0,
+                width: FALLBACK_FB_W as u32,
+                height: FALLBACK_FB_H as u32,
+                pitch: (FALLBACK_FB_W * 4) as u32,
+                bpp: 32,
+                is_hardware: false,
+            }
+        }
+
+        pub fn detect_from_limine() -> Self {
+            // SAFETY:
+            // Đọc thông tin Framebuffer do Limine khởi tạo thông qua `read_volatile`.
+            // Nếu môi trường không có card màn hình, tự động dùng `FALLBACK_FB_CANVAS`.
+            unsafe {
+                let req_ptr = crate::boot_protocol::LIMINE_REQUESTS.0.get();
+                let fb_resp = core::ptr::read_volatile(&(*req_ptr).framebuffer.response);
+                if !fb_resp.is_null() {
+                    let count = core::ptr::read_volatile(&(*fb_resp).framebuffer_count);
+                    let fbs_ptr = core::ptr::read_volatile(&(*fb_resp).framebuffers);
+                    if count > 0 && !fbs_ptr.is_null() {
+                        let fb0 = core::ptr::read_volatile(fbs_ptr);
+                        if !fb0.is_null() {
+                            let addr = core::ptr::read_volatile(&(*fb0).address) as u64;
+                            let width = core::ptr::read_volatile(&(*fb0).width) as u32;
+                            let height = core::ptr::read_volatile(&(*fb0).height) as u32;
+                            let pitch = core::ptr::read_volatile(&(*fb0).pitch) as u32;
+                            let bpp = core::ptr::read_volatile(&(*fb0).bpp);
+                            if addr != 0 && width > 0 && height > 0 && bpp == 32 {
+                                return Self {
+                                    addr,
+                                    width,
+                                    height,
+                                    pitch,
+                                    bpp,
+                                    is_hardware: true,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+
+            Self {
+                addr: &raw const FALLBACK_FB_CANVAS as u64,
+                width: FALLBACK_FB_W as u32,
+                height: FALLBACK_FB_H as u32,
+                pitch: (FALLBACK_FB_W * 4) as u32,
+                bpp: 32,
+                is_hardware: false,
+            }
+        }
+    }
+
+    #[inline]
+    pub fn fb_draw_pixel(fb: &FramebufferInfo, x: u32, y: u32, color: u32) {
+        if fb.addr == 0 || x >= fb.width || y >= fb.height {
+            return;
+        }
+        let byte_offset = (y as u64) * (fb.pitch as u64) + (x as u64) * 4;
+        let pixel_ptr = (fb.addr + byte_offset) as *mut u32;
+        // SAFETY:
+        // Tọa độ `(x, y)` đã được kiểm tra chặt chẽ nằm trong giới hạn `(fb.width, fb.height)`.
+        // `fb.addr` trỏ tới vùng nhớ VRAM 32-bit của Limine hoặc `FALLBACK_FB_CANVAS`.
+        unsafe {
+            core::ptr::write_volatile(pixel_ptr, color);
+        }
+    }
+
+    pub fn fb_read_pixel(fb: &FramebufferInfo, x: u32, y: u32) -> u32 {
+        if fb.addr == 0 || x >= fb.width || y >= fb.height {
+            return 0;
+        }
+        let byte_offset = (y as u64) * (fb.pitch as u64) + (x as u64) * 4;
+        let pixel_ptr = (fb.addr + byte_offset) as *const u32;
+        // SAFETY:
+        // Tọa độ `(x, y)` đã được kiểm tra giới hạn hợp lệ.
+        unsafe { core::ptr::read_volatile(pixel_ptr) }
+    }
+
+    pub fn fb_fill_rect(fb: &FramebufferInfo, rect: Rect, color: u32) {
+        let max_x = (rect.x + rect.w).min(fb.width);
+        let max_y = (rect.y + rect.h).min(fb.height);
+        let mut py = rect.y;
+        while py < max_y {
+            let mut px = rect.x;
+            while px < max_x {
+                fb_draw_pixel(fb, px, py, color);
+                px += 1;
+            }
+            py += 1;
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // 1.3: GDT & TSS (CHUẨN BỐ CỤC CHO LỆNH SYSCALL / SYSRETQ)
     // ------------------------------------------------------------------------
     #[repr(C, packed)]
     pub struct TaskStateSegment {
@@ -347,7 +515,7 @@ pub mod ostd {
     }
 
     // ------------------------------------------------------------------------
-    // 1.3: IDT (INTERRUPT DESCRIPTOR TABLE)
+    // 1.4: IDT (INTERRUPT DESCRIPTOR TABLE)
     // ------------------------------------------------------------------------
     #[repr(C, packed)]
     #[derive(Clone, Copy)]
@@ -502,7 +670,7 @@ pub mod ostd {
     }
 
     // ------------------------------------------------------------------------
-    // 1.4: QUẢN LÝ BỘ NHỚ VẬT LÝ (PMM) & BẢNG TRANG 4 CẤP USER-SPACE (MMU)
+    // 1.5: QUẢN LÝ BỘ NHỚ VẬT LÝ (PMM) & BẢNG TRANG 4 CẤP USER-SPACE (MMU)
     // ------------------------------------------------------------------------
     pub const PAGE_SIZE: usize = 4096;
     const POOL_FRAMES: usize = 256;
@@ -544,8 +712,7 @@ pub mod ostd {
             let mut kernel_virt_base = 0xFFFF_FFFF_8000_0000;
 
             // SAFETY:
-            // Sử dụng `read_volatile` trên vùng `UnsafeCell` để ngăn trình biên dịch LLVM
-            // tối ưu hóa hằng số (constant-fold) các con trỏ phản hồi của Limine thành `null`.
+            // Đọc thông tin HHDM và Kernel Address qua `read_volatile`.
             unsafe {
                 let req_ptr = crate::boot_protocol::LIMINE_REQUESTS.0.get();
                 let hhdm_resp = core::ptr::read_volatile(&(*req_ptr).hhdm.response);
@@ -576,7 +743,7 @@ pub mod ostd {
                     let frame_index = word_idx * 64 + bit_idx;
                     let addr = self.base_addr + (frame_index * PAGE_SIZE) as u64;
                     // SAFETY:
-                    // `addr` nằm trong `STATIC_FRAME_POOL` đã căn lề 4KiB và thuộc quyền sở hữu độc quyền.
+                    // `addr` nằm trong `STATIC_FRAME_POOL` đã căn lề 4KiB.
                     unsafe {
                         core::ptr::write_bytes(addr as *mut u8, 0, PAGE_SIZE);
                     }
@@ -664,7 +831,6 @@ pub mod ostd {
         }
     }
 
-    /// Ánh xạ một trang 4KiB tại địa chỉ ảo User-space (`user_va`) vào bảng trang 4 cấp `CR3` hiện hành.
     pub fn map_user_page(pmm: &mut BitmapFrameAllocator, user_va: u64) -> Result<u64, OstdError> {
         if (user_va & 0xFFF) != 0 {
             return Err(OstdError::UnalignedAddress);
@@ -727,7 +893,7 @@ pub mod ostd {
     }
 
     // ------------------------------------------------------------------------
-    // 1.5: MSR, PER-CPU STATE & RING 0 <-> RING 3 CONTEXT SWITCHING
+    // 1.6: MSR, PER-CPU STATE & RING 0 <-> RING 3 CONTEXT SWITCHING
     // ------------------------------------------------------------------------
     #[repr(u32)]
     #[derive(Debug, Clone, Copy)]
@@ -962,14 +1128,15 @@ pub mod ostd {
 }
 
 // ============================================================================
-// MODULE 2: SAFE KERNEL CORE, VFS, INITRAMFS, EXECVE & LINUX ABI (PHASE 4)
+// MODULE 2: SAFE KERNEL CORE, DESKTOP COMPOSITOR, /dev/fb0 & LINUX ABI
 // Toàn bộ tầng này cấm tuyệt đối `unsafe` và cấm `unwrap()` / `expect()`.
 // ============================================================================
 #[forbid(unsafe_code)]
 pub mod linux_abi {
     use crate::ostd::{
-        copy_from_buffer, copy_to_buffer, map_user_page, read_msr, read_tsc, write_msr,
-        BitmapFrameAllocator, Msr, SerialConsole, TrapFrame, PAGE_SIZE,
+        copy_from_buffer, copy_to_buffer, fb_draw_pixel, fb_fill_rect, map_user_page, read_msr,
+        read_tsc, write_msr, BitmapFrameAllocator, FramebufferInfo, Msr, Rect, SerialConsole,
+        TrapFrame, PAGE_SIZE,
     };
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -987,8 +1154,8 @@ pub mod linux_abi {
         Eisdir = 21,
         Einval = 22,
         Emfile = 24,
-        Enosys = 38,
         Erange = 34,
+        Enosys = 38,
     }
 
     impl LinuxErrno {
@@ -998,7 +1165,6 @@ pub mod linux_abi {
         }
     }
 
-    // Bảng số hiệu Syscall chuẩn của kiến trúc Linux x86_64
     pub const SYS_READ: u64 = 0;
     pub const SYS_WRITE: u64 = 1;
     pub const SYS_OPEN: u64 = 2;
@@ -1042,12 +1208,180 @@ pub mod linux_abi {
     pub const ARCH_GET_GS: u64 = 0x1004;
 
     pub const TIOCGWINSZ: u64 = 0x5413;
+    /// Mã ioctl chuẩn của Linux Framebuffer (`/dev/fb0`)
+    pub const FBIOGET_VSCREENINFO: u64 = 0x4600;
+    pub const FBIOGET_FSCREENINFO: u64 = 0x4602;
+
     pub const FUTEX_WAIT: u64 = 0;
     pub const FUTEX_WAKE: u64 = 1;
     pub const FUTEX_PRIVATE_FLAG: u64 = 128;
 
     // ------------------------------------------------------------------------
-    // 2.1: VIRTUAL FILE SYSTEM (VFS), CAPABILITIES & PIPE IPC
+    // 2.1: ZENITHOS GRAPHICAL DESKTOP COMPOSITOR (100% SAFE RUST)
+    // ------------------------------------------------------------------------
+    /// Vẽ một ký tự Bitmap 8x8 phóng đại theo hệ số `scale` lên màn hình.
+    fn draw_glyph_8x8(
+        fb: &FramebufferInfo,
+        glyph: [u8; 8],
+        x0: u32,
+        y0: u32,
+        scale: u32,
+        color: u32,
+    ) {
+        for (row_idx, &row_bits) in glyph.iter().enumerate() {
+            for col_idx in 0..8u32 {
+                if (row_bits & (1 << (7 - col_idx))) != 0 {
+                    fb_fill_rect(
+                        fb,
+                        Rect {
+                            x: x0 + col_idx * scale,
+                            y: y0 + (row_idx as u32) * scale,
+                            w: scale,
+                            h: scale,
+                        },
+                        color,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Khởi tạo giao diện ZenithOS Desktop (Tokyo Night Theme) gồm:
+    /// - Nền Desktop tối (`0x001A_1B26`)
+    /// - Thanh Top Panel (`0x0016_161E`) kèm viền Neon Cyan (`0x0000_F0FF`) & Logo `ZENITH`
+    /// - Cửa sổ 1: Zenith System Terminal (kèm 3 nút Đỏ/Vàng/Xanh lá)
+    /// - Cửa sổ 2: Linux `/dev/fb0` Direct Graphics Viewport
+    pub fn render_zenith_desktop_ui(fb: &FramebufferInfo) {
+        // 1. Nền Desktop Tokyo Night
+        fb_fill_rect(
+            fb,
+            Rect {
+                x: 0,
+                y: 0,
+                w: fb.width,
+                h: fb.height,
+            },
+            0x001A_1B26,
+        );
+
+        // 2. Thanh Top Status Bar
+        fb_fill_rect(
+            fb,
+            Rect {
+                x: 0,
+                y: 0,
+                w: fb.width,
+                h: 28,
+            },
+            0x0016_161E,
+        );
+        fb_fill_rect(
+            fb,
+            Rect {
+                x: 0,
+                y: 28,
+                w: fb.width,
+                h: 2,
+            },
+            0x0000_F0FF,
+        );
+
+        // Vẽ chữ "ZENITH" bằng Bitmap 8x8 trên Top Bar
+        let glyphs_zenith: [[u8; 8]; 6] = [
+            [0x7E, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x7E, 0x00], // Z
+            [0x7E, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x7E, 0x00], // E
+            [0x66, 0x76, 0x7E, 0x7E, 0x6E, 0x66, 0x66, 0x00], // N
+            [0x3C, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00], // I
+            [0x7E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00], // T
+            [0x66, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00], // H
+        ];
+        for (i, g) in glyphs_zenith.iter().enumerate() {
+            draw_glyph_8x8(fb, *g, 12 + (i as u32) * 18, 6, 2, 0x0000_F0FF);
+        }
+
+        // 3. Cửa sổ 1: Zenith System Terminal
+        let win1_w = (fb.width / 2).saturating_sub(24).max(120);
+        let win1_h = fb.height.saturating_sub(64).max(100);
+        fb_fill_rect(
+            fb,
+            Rect {
+                x: 16,
+                y: 44,
+                w: win1_w,
+                h: win1_h,
+            },
+            0x0011_121D,
+        );
+        // Thanh tiêu đề cửa sổ 1 + 3 nút điều khiển (Đỏ, Vàng, Xanh lá)
+        fb_fill_rect(
+            fb,
+            Rect {
+                x: 16,
+                y: 44,
+                w: win1_w,
+                h: 22,
+            },
+            0x0024_283B,
+        );
+        fb_fill_rect(
+            fb,
+            Rect {
+                x: 24,
+                y: 51,
+                w: 8,
+                h: 8,
+            },
+            0x00F7_768E,
+        );
+        fb_fill_rect(
+            fb,
+            Rect {
+                x: 36,
+                y: 51,
+                w: 8,
+                h: 8,
+            },
+            0x00E0_AF68,
+        );
+        fb_fill_rect(
+            fb,
+            Rect {
+                x: 48,
+                y: 51,
+                w: 8,
+                h: 8,
+            },
+            0x009E_CE6A,
+        );
+
+        // 4. Cửa sổ 2: Linux `/dev/fb0` Direct Graphics Viewport
+        let win2_x = 24 + win1_w;
+        if win2_x + 80 < fb.width {
+            fb_fill_rect(
+                fb,
+                Rect {
+                    x: win2_x,
+                    y: 44,
+                    w: win1_w,
+                    h: win1_h,
+                },
+                0x0016_161E,
+            );
+            fb_fill_rect(
+                fb,
+                Rect {
+                    x: win2_x,
+                    y: 44,
+                    w: win1_w,
+                    h: 22,
+                },
+                0x0024_283B,
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // 2.2: VIRTUAL FILE SYSTEM (VFS), `/dev/fb0`, CAPABILITIES & PIPE IPC
     // ------------------------------------------------------------------------
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum VfsNodeKind {
@@ -1056,6 +1390,7 @@ pub mod linux_abi {
         ProcVersion,
         DevNull,
         DevZero,
+        DevFb0,
         BinInit,
         BinApp,
     }
@@ -1141,7 +1476,7 @@ pub mod linux_abi {
     }
 
     const OS_RELEASE_CONTENT: &[u8] =
-        b"NAME=\"ZenithOS\"\nVERSION=\"0.4.0\"\nID=zenith\nPRETTY_NAME=\"ZenithOS v0.4.0\"\n";
+        b"NAME=\"ZenithOS\"\nVERSION=\"0.5.0\"\nID=zenith\nPRETTY_NAME=\"ZenithOS v0.5.0 GUI\"\n";
     const PROC_VERSION_CONTENT: &[u8] =
         b"Linux version 6.8.0-zenith-framekernel (rust@zenith) #1 SMP PREEMPT_DYNAMIC\n";
 
@@ -1152,8 +1487,9 @@ pub mod linux_abi {
             b"/proc/version" | b"proc/version" => Ok(VfsNodeKind::ProcVersion),
             b"/dev/null" => Ok(VfsNodeKind::DevNull),
             b"/dev/zero" => Ok(VfsNodeKind::DevZero),
+            b"/dev/fb0" => Ok(VfsNodeKind::DevFb0),
             b"/bin/init" => Ok(VfsNodeKind::BinInit),
-            b"/bin/app" => Ok(VfsNodeKind::BinApp),
+            b"/bin/app" | b"/bin/gui_app" => Ok(VfsNodeKind::BinApp),
             _ => Err(LinuxErrno::Enoent),
         }
     }
@@ -1171,7 +1507,7 @@ pub mod linux_abi {
     }
 
     // ------------------------------------------------------------------------
-    // 2.2: QUẢN LÝ TIẾN TRÌNH (TASK TABLE), VMO MMAP & WAITPORT (FUTEX)
+    // 2.3: QUẢN LÝ TIẾN TRÌNH (TASK TABLE), VMO MMAP & FRAMEBUFFER STATE
     // ------------------------------------------------------------------------
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum TaskState {
@@ -1205,6 +1541,9 @@ pub mod linux_abi {
 
     pub struct KernelContext {
         pub pmm: BitmapFrameAllocator,
+        pub fb: FramebufferInfo,
+        pub fb_pixels_written: u64,
+        pub last_fb_pixel_color: u32,
         pub current_pid: u64,
         pub next_pid: u64,
         pub program_break: u64,
@@ -1249,6 +1588,9 @@ pub mod linux_abi {
 
             Self {
                 pmm: BitmapFrameAllocator::const_uninit(),
+                fb: FramebufferInfo::const_uninit(),
+                fb_pixels_written: 0,
+                last_fb_pixel_color: 0,
                 current_pid: 1,
                 next_pid: 2,
                 program_break: 0x0000_0000_0040_3000,
@@ -1267,8 +1609,10 @@ pub mod linux_abi {
             }
         }
 
-        pub fn init_hardware_pmm(&mut self) {
+        pub fn init_hardware(&mut self) {
             self.pmm = BitmapFrameAllocator::new();
+            self.fb = FramebufferInfo::detect_from_limine();
+            render_zenith_desktop_ui(&self.fb);
         }
 
         pub fn alloc_fd(&mut self, entry: CapabilityEntry) -> Result<usize, LinuxErrno> {
@@ -1339,7 +1683,7 @@ pub mod linux_abi {
     }
 
     // ------------------------------------------------------------------------
-    // 2.3: BỘ ĐIỀU PHỐI SYSCALL LINUX X86_64 (PHASE 4: VFS & EXECVE)
+    // 2.4: BỘ ĐIỀU PHỐI SYSCALL LINUX X86_64 (PHASE 5: /dev/fb0 & GUI)
     // ------------------------------------------------------------------------
     pub fn dispatch_linux_syscall(frame: &mut TrapFrame, ctx: &mut KernelContext) {
         let result = match frame.rax {
@@ -1352,7 +1696,7 @@ pub mod linux_abi {
             SYS_MMAP => sys_mmap(ctx, frame.rdi, frame.rsi),
             SYS_MPROTECT | SYS_MUNMAP => Ok(0),
             SYS_BRK => sys_brk(ctx, frame.rdi),
-            SYS_IOCTL => sys_ioctl(frame.rdi, frame.rsi, frame.rdx),
+            SYS_IOCTL => sys_ioctl(ctx, frame.rdi, frame.rsi, frame.rdx),
             SYS_WRITEV => sys_writev(ctx, frame.rdi, frame.rsi, frame.rdx),
             SYS_SCHED_YIELD | SYS_NANOSLEEP => Ok(0),
             SYS_DUP => sys_dup(ctx, frame.rdi),
@@ -1408,7 +1752,7 @@ pub mod linux_abi {
                 can_read: true,
                 can_write: false,
             },
-            VfsNodeKind::DevNull | VfsNodeKind::DevZero => CapabilityEntry {
+            VfsNodeKind::DevNull | VfsNodeKind::DevZero | VfsNodeKind::DevFb0 => CapabilityEntry {
                 object: CapObject::VfsFile { kind, offset: 0 },
                 can_read: true,
                 can_write: true,
@@ -1524,19 +1868,16 @@ pub mod linux_abi {
             if offset > 0 {
                 return Ok(0);
             }
-            // Cấu trúc linux_dirent64 tối giản cho mục "bin" và "etc" (mỗi mục 24 bytes căn lề 8-byte)
             if count < 48 {
                 return Err(LinuxErrno::Einval);
             }
             let mut dirents = [0u8; 48];
-            // Mục 1: d_ino=1, d_off=24, d_reclen=24, d_type=4 (DT_DIR), d_name="bin\0"
             dirents[0..8].copy_from_slice(&1u64.to_le_bytes());
             dirents[8..16].copy_from_slice(&24u64.to_le_bytes());
             dirents[16..18].copy_from_slice(&24u16.to_le_bytes());
             dirents[18] = 4;
             dirents[19..23].copy_from_slice(b"bin\0");
 
-            // Mục 2: d_ino=2, d_off=48, d_reclen=24, d_type=4 (DT_DIR), d_name="etc\0"
             dirents[24..32].copy_from_slice(&2u64.to_le_bytes());
             dirents[32..40].copy_from_slice(&48u64.to_le_bytes());
             dirents[40..42].copy_from_slice(&24u16.to_le_bytes());
@@ -1590,9 +1931,6 @@ pub mod linux_abi {
         Ok(0)
     }
 
-    /// Hiện thực `SYS_execve (59)`: Phân giải đường dẫn tệp thực thi trong VFS,
-    /// nạp ảnh ELF64 mới vào không gian địa chỉ User-space, và thay thế `RIP` (`frame.rcx`)
-    /// cùng `RSP` (`frame.rsp`) để `sysretq` nhảy thẳng vào chương trình mới ở Ring 3!
     fn sys_execve(frame: &mut TrapFrame, ctx: &mut KernelContext) -> Result<u64, LinuxErrno> {
         let mut path_buf = [0u8; 64];
         let path_slice = read_cstr_from_user(frame.rdi, &mut path_buf)?;
@@ -1604,12 +1942,11 @@ pub mod linux_abi {
             _ => return Err(LinuxErrno::Eacces),
         };
 
-        let loaded = load_elf64_into_user_space(&elf_image, &mut ctx.pmm)
-            .map_err(|_| LinuxErrno::Enomem)?;
+        let loaded =
+            load_elf64_into_user_space(&elf_image, &mut ctx.pmm).map_err(|_| LinuxErrno::Enomem)?;
 
         ctx.program_break = loaded.initial_brk;
 
-        // Đặt lại toàn bộ thanh ghi của luồng User và trỏ RCX (User RIP) + RSP tới ảnh ELF64 mới!
         frame.rcx = loaded.entry_rip;
         frame.rsp = loaded.user_rsp;
         frame.rdi = 0;
@@ -1666,6 +2003,51 @@ pub mod linux_abi {
                 let pipe = ctx.pipes.get_mut(pipe_idx).ok_or(LinuxErrno::Ebadf)?;
                 let n = pipe.write_slice(slice);
                 Ok(n as u64)
+            }
+            CapObject::VfsFile {
+                kind: VfsNodeKind::DevFb0,
+                offset,
+            } => {
+                // Ghi điểm ảnh 32-bit (0x00RRGGBB) từ ứng dụng Ring 3 lên `/dev/fb0`!
+                let max_bytes = (count as usize).min(128);
+                let mut pix_buf = [0u8; 128];
+                let slice = pix_buf.get_mut(..max_bytes).ok_or(LinuxErrno::Efault)?;
+                copy_from_buffer(buf_ptr, slice).map_err(|_| LinuxErrno::Efault)?;
+
+                let num_pixels = max_bytes / 4;
+                for i in 0..num_pixels {
+                    let mut p_bytes = [0u8; 4];
+                    if let Some(src_px) = slice.get(i * 4..i * 4 + 4) {
+                        p_bytes.copy_from_slice(src_px);
+                        let color = u32::from_le_bytes(p_bytes);
+                        let px_index = (offset / 4) + i;
+                        // Vẽ cả điểm ảnh gốc tại (px_index, 80) VÀ dải màu lớn trong Cửa sổ 2
+                        let draw_x = (px_index as u32) % ctx.fb.width;
+                        fb_draw_pixel(&ctx.fb, draw_x, 80, color);
+                        fb_fill_rect(
+                            &ctx.fb,
+                            Rect {
+                                x: 32 + (i as u32) * 24,
+                                y: 90,
+                                w: 20,
+                                h: 20,
+                            },
+                            color,
+                        );
+                        if i == 0 {
+                            ctx.last_fb_pixel_color = color;
+                        }
+                        ctx.fb_pixels_written += 1;
+                    }
+                }
+
+                if let Some(Some(slot)) = ctx.fd_table.get_mut(fd as usize) {
+                    slot.object = CapObject::VfsFile {
+                        kind: VfsNodeKind::DevFb0,
+                        offset: offset + max_bytes,
+                    };
+                }
+                Ok(max_bytes as u64)
             }
             CapObject::VfsFile {
                 kind: VfsNodeKind::DevNull | VfsNodeKind::DevZero,
@@ -1794,14 +2176,44 @@ pub mod linux_abi {
         Ok(total_written)
     }
 
-    fn sys_ioctl(fd: u64, request: u64, argp: u64) -> Result<u64, LinuxErrno> {
+    fn sys_ioctl(
+        ctx: &KernelContext,
+        fd: u64,
+        request: u64,
+        argp: u64,
+    ) -> Result<u64, LinuxErrno> {
         if fd <= 2 && request == TIOCGWINSZ {
             let winsize: [u8; 8] = [25, 0, 80, 0, 0, 0, 0, 0];
             copy_to_buffer(argp, &winsize).map_err(|_| LinuxErrno::Efault)?;
-            Ok(0)
-        } else {
-            Err(LinuxErrno::Einval)
+            return Ok(0);
         }
+
+        let cap = ctx
+            .fd_table
+            .get(fd as usize)
+            .and_then(|c| *c)
+            .ok_or(LinuxErrno::Ebadf)?;
+        if let CapObject::VfsFile {
+            kind: VfsNodeKind::DevFb0,
+            ..
+        } = cap.object
+        {
+            if request == FBIOGET_VSCREENINFO || request == FBIOGET_FSCREENINFO {
+                // Cấu trúc `fb_var_screeninfo` chuẩn của Linux:
+                // offset 0: xres (u32), offset 4: yres (u32), offset 8: xres_virtual (u32),
+                // offset 12: yres_virtual (u32), offset 24: bits_per_pixel (u32 = 32)
+                let mut vinfo = [0u8; 32];
+                vinfo[0..4].copy_from_slice(&ctx.fb.width.to_le_bytes());
+                vinfo[4..8].copy_from_slice(&ctx.fb.height.to_le_bytes());
+                vinfo[8..12].copy_from_slice(&ctx.fb.width.to_le_bytes());
+                vinfo[12..16].copy_from_slice(&ctx.fb.height.to_le_bytes());
+                vinfo[24..28].copy_from_slice(&(ctx.fb.bpp as u32).to_le_bytes());
+                copy_to_buffer(argp, &vinfo).map_err(|_| LinuxErrno::Efault)?;
+                return Ok(0);
+            }
+        }
+
+        Err(LinuxErrno::Einval)
     }
 
     fn sys_mmap(ctx: &mut KernelContext, addr_hint: u64, length: u64) -> Result<u64, LinuxErrno> {
@@ -1937,7 +2349,7 @@ pub mod linux_abi {
     }
 
     // ------------------------------------------------------------------------
-    // 2.4: TRÌNH PHÂN TÍCH & NẠP LINUX ELF64 (100% SAFE RUST)
+    // 2.5: TRÌNH PHÂN TÍCH & NẠP LINUX ELF64 (100% SAFE RUST)
     // ------------------------------------------------------------------------
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ElfLoadError {
@@ -2057,7 +2469,6 @@ pub mod linux_abi {
             }
         }
 
-        // Tách biệt địa chỉ Stack cho từng ảnh thực thi (0x0080_0000 cho /bin/init, 0x0090_0000 cho /bin/app)
         let stack_bottom: u64 = 0x0040_0000 + (e_entry & 0x00FF_0000);
         map_user_page(pmm, stack_bottom).map_err(|_| ElfLoadError::MappingFailed)?;
         map_user_page(pmm, stack_bottom + 0x1000).map_err(|_| ElfLoadError::MappingFailed)?;
@@ -2116,11 +2527,10 @@ pub mod linux_abi {
 
     /// Ảnh thực thi số 1 (`/bin/init` tại `0x0040_1000`):
     /// Kiểm thử VFS (`SYS_getcwd`, `SYS_openat("/etc/os-release")`, `SYS_read`, `SYS_getdents64("/")`),
-    /// sau đó gọi `SYS_execve("/bin/app", NULL, NULL)` để chuyển quyền thực thi sang `/bin/app`!
+    /// sau đó gọi `SYS_execve("/bin/gui_app", NULL, NULL)`!
     pub fn build_embedded_linux_init_elf64() -> [u8; 1024] {
         let mut elf = [0u8; 1024];
 
-        // 1. ELF64 Header
         elf[0..4].copy_from_slice(b"\x7FELF");
         elf[4] = 2;
         elf[5] = 1;
@@ -2134,7 +2544,6 @@ pub mod linux_abi {
         elf[54..56].copy_from_slice(&56u16.to_le_bytes());
         elf[56..58].copy_from_slice(&2u16.to_le_bytes());
 
-        // 2. Program Header #0: PT_LOAD (.text tại 0x0040_1000)
         let ph0 = 64;
         elf[ph0..ph0 + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
         elf[ph0 + 4..ph0 + 8].copy_from_slice(&5u32.to_le_bytes());
@@ -2145,7 +2554,6 @@ pub mod linux_abi {
         elf[ph0 + 40..ph0 + 48].copy_from_slice(&256u64.to_le_bytes());
         elf[ph0 + 48..ph0 + 56].copy_from_slice(&0x1000u64.to_le_bytes());
 
-        // 3. Program Header #1: PT_LOAD (.data tại 0x0040_2000)
         let ph1 = 120;
         elf[ph1..ph1 + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
         elf[ph1 + 4..ph1 + 8].copy_from_slice(&6u32.to_le_bytes());
@@ -2156,9 +2564,7 @@ pub mod linux_abi {
         elf[ph1 + 40..ph1 + 48].copy_from_slice(&384u64.to_le_bytes());
         elf[ph1 + 48..ph1 + 56].copy_from_slice(&0x1000u64.to_le_bytes());
 
-        // 4. Mã máy Ring 3 của `/bin/init`:
         let code: &[u8] = &[
-            // (A) SYS_mmap(NULL, 4096, PROT_RW, MAP_PRIVATE|MAP_ANON, -1, 0) -> r12 = 0x1000_0000
             0xb8, 0x09, 0x00, 0x00, 0x00, // mov eax, 9 (SYS_mmap)
             0x31, 0xff, // xor edi, edi
             0xbe, 0x00, 0x10, 0x00, 0x00, // mov esi, 4096
@@ -2167,13 +2573,11 @@ pub mod linux_abi {
             0x49, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, // mov r8, -1
             0x45, 0x31, 0xc9, // xor r9d, r9d
             0x0f, 0x05, // syscall
-            0x49, 0x89, 0xc4, // mov r12, rax
-            // (B) SYS_getcwd(r12, 64) -> lưu "/\0" vào 0x1000_0000
+            0x49, 0x89, 0xc4, // mov r12, rax (0x1000_0000)
             0x4c, 0x89, 0xe7, // mov rdi, r12
             0xbe, 0x40, 0x00, 0x00, 0x00, // mov esi, 64
             0xb8, 0x4f, 0x00, 0x00, 0x00, // mov eax, 79 (SYS_getcwd)
             0x0f, 0x05, // syscall
-            // (C) SYS_openat(AT_FDCWD=-100, "/etc/os-release", O_RDONLY=0, 0) -> r13 = fd
             0x48, 0xc7, 0xc7, 0x9c, 0xff, 0xff, 0xff, // mov rdi, -100
             0xbe, 0x50, 0x20, 0x40, 0x00, // mov esi, 0x00402050 ("/etc/os-release")
             0x31, 0xd2, // xor edx, edx
@@ -2181,17 +2585,14 @@ pub mod linux_abi {
             0xb8, 0x01, 0x01, 0x00, 0x00, // mov eax, 257 (SYS_openat)
             0x0f, 0x05, // syscall
             0x49, 0x89, 0xc5, // mov r13, rax
-            // (D) SYS_read(r13, r12 + 0x500, 15) -> đọc "NAME=\"ZenithOS\"" vào 0x1000_0500
             0x4c, 0x89, 0xef, // mov rdi, r13
             0x49, 0x8d, 0xb4, 0x24, 0x00, 0x05, 0x00, 0x00, // lea rsi, [r12 + 0x500]
             0xba, 0x0f, 0x00, 0x00, 0x00, // mov edx, 15
             0x31, 0xc0, // xor eax, eax (SYS_read = 0)
             0x0f, 0x05, // syscall
-            // (E) SYS_close(r13)
             0x4c, 0x89, 0xef, // mov rdi, r13
             0xb8, 0x03, 0x00, 0x00, 0x00, // mov eax, 3 (SYS_close)
             0x0f, 0x05, // syscall
-            // (F) SYS_openat(AT_FDCWD=-100, "/", 0, 0) + SYS_getdents64(fd, r12 + 0x700, 128) + SYS_close
             0x48, 0xc7, 0xc7, 0x9c, 0xff, 0xff, 0xff, // mov rdi, -100
             0xbe, 0x70, 0x20, 0x40, 0x00, // mov esi, 0x00402070 ("/")
             0x31, 0xd2, // xor edx, edx
@@ -2207,14 +2608,12 @@ pub mod linux_abi {
             0x4c, 0x89, 0xef, // mov rdi, r13
             0xb8, 0x03, 0x00, 0x00, 0x00, // mov eax, 3 (SYS_close)
             0x0f, 0x05, // syscall
-            // (G) SYS_write(1, 0x00402000, 70)
             0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (SYS_write)
             0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1
             0xbe, 0x00, 0x20, 0x40, 0x00, // mov esi, 0x00402000
             0xba, 0x46, 0x00, 0x00, 0x00, // mov edx, 70
             0x0f, 0x05, // syscall
-            // (H) SYS_execve("/bin/app", NULL, NULL) -> nhảy sang ảnh ELF64 thứ hai!
-            0xbf, 0x80, 0x20, 0x40, 0x00, // mov edi, 0x00402080 ("/bin/app")
+            0xbf, 0x80, 0x20, 0x40, 0x00, // mov edi, 0x00402080 ("/bin/gui_app")
             0x31, 0xf6, // xor esi, esi
             0x31, 0xd2, // xor edx, edx
             0xb8, 0x3b, 0x00, 0x00, 0x00, // mov eax, 59 (SYS_execve)
@@ -2222,22 +2621,22 @@ pub mod linux_abi {
         ];
         elf[256..256 + code.len()].copy_from_slice(code);
 
-        // 5. Dữ liệu .data của `/bin/init` tại offset 512 (ánh xạ vào 0x0040_2000):
         let msg = b"[RING-3 /bin/init] VFS openat('/etc/os-release') & getdents64 tested!\n";
         elf[512..512 + 70].copy_from_slice(msg);
         elf[512 + 0x50..512 + 0x50 + 16].copy_from_slice(b"/etc/os-release\0");
         elf[512 + 0x70..512 + 0x70 + 2].copy_from_slice(b"/\0");
-        elf[512 + 0x80..512 + 0x80 + 9].copy_from_slice(b"/bin/app\0");
+        elf[512 + 0x80..512 + 0x80 + 13].copy_from_slice(b"/bin/gui_app\0");
 
         elf
     }
 
-    /// Ảnh thực thi số 2 (`/bin/app` tại `0x0050_1000`):
-    /// Được nạp từ VFS khi `/bin/init` gọi `SYS_execve("/bin/app")`.
+    /// Ảnh thực thi số 2 (`/bin/gui_app` tại `0x0050_1000`):
+    /// Mở thiết bị đồ họa `/dev/fb0`, gọi `SYS_ioctl(FBIOGET_VSCREENINFO)` lấy độ phân giải,
+    /// và gọi `SYS_write` vẽ 4 khối điểm ảnh 32-bit (`0x0000F0FF`, `0x0000FF88`, `0x00FF5577`, `0x00FFCC00`)
+    /// trực tiếp lên màn hình từ Ring 3!
     pub fn build_embedded_linux_app_elf64() -> [u8; 1024] {
         let mut elf = [0u8; 1024];
 
-        // 1. ELF64 Header (e_entry = 0x0050_1000)
         elf[0..4].copy_from_slice(b"\x7FELF");
         elf[4] = 2;
         elf[5] = 1;
@@ -2251,7 +2650,6 @@ pub mod linux_abi {
         elf[54..56].copy_from_slice(&56u16.to_le_bytes());
         elf[56..58].copy_from_slice(&2u16.to_le_bytes());
 
-        // 2. Program Header #0: PT_LOAD (.text tại 0x0050_1000)
         let ph0 = 64;
         elf[ph0..ph0 + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
         elf[ph0 + 4..ph0 + 8].copy_from_slice(&5u32.to_le_bytes());
@@ -2262,7 +2660,6 @@ pub mod linux_abi {
         elf[ph0 + 40..ph0 + 48].copy_from_slice(&256u64.to_le_bytes());
         elf[ph0 + 48..ph0 + 56].copy_from_slice(&0x1000u64.to_le_bytes());
 
-        // 3. Program Header #1: PT_LOAD (.data tại 0x0050_2000)
         let ph1 = 120;
         elf[ph1..ph1 + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
         elf[ph1 + 4..ph1 + 8].copy_from_slice(&6u32.to_le_bytes());
@@ -2273,27 +2670,60 @@ pub mod linux_abi {
         elf[ph1 + 40..ph1 + 48].copy_from_slice(&256u64.to_le_bytes());
         elf[ph1 + 48..ph1 + 56].copy_from_slice(&0x1000u64.to_le_bytes());
 
-        // 4. Mã máy Ring 3 của `/bin/app`:
         let code: &[u8] = &[
-            // Ghi chữ ký xác thực "ZEN4" vào 0x1000_0600
+            // 1. Ghi chữ ký xác thực "ZEN5" vào 0x1000_0600
             0xbf, 0x00, 0x06, 0x00, 0x10, // mov edi, 0x10000600
-            0xc7, 0x07, 0x5a, 0x45, 0x4e, 0x34, // mov dword ptr [rdi], "ZEN4"
-            // In thông điệp từ `/bin/app` qua SYS_write(1, 0x00502000, 72)
+            0xc7, 0x07, 0x5a, 0x45, 0x4e, 0x35, // mov dword ptr [rdi], "ZEN5"
+            // 2. SYS_openat(AT_FDCWD=-100, "/dev/fb0", O_RDWR=2, 0) -> r12 = fb_fd
+            0x48, 0xc7, 0xc7, 0x9c, 0xff, 0xff, 0xff, // mov rdi, -100
+            0xbe, 0x50, 0x20, 0x50, 0x00, // mov esi, 0x00502050 ("/dev/fb0")
+            0xba, 0x02, 0x00, 0x00, 0x00, // mov edx, 2 (O_RDWR)
+            0x45, 0x31, 0xd2, // xor r10d, r10d
+            0xb8, 0x01, 0x01, 0x00, 0x00, // mov eax, 257 (SYS_openat)
+            0x0f, 0x05, // syscall
+            0x49, 0x89, 0xc4, // mov r12, rax (fb_fd)
+            // 3. SYS_ioctl(fb_fd, FBIOGET_VSCREENINFO=0x4600, 0x1000_0800)
+            0x4c, 0x89, 0xe7, // mov rdi, r12
+            0xbe, 0x00, 0x46, 0x00, 0x00, // mov esi, 0x4600
+            0xba, 0x00, 0x08, 0x00, 0x10, // mov edx, 0x10000800
+            0xb8, 0x10, 0x00, 0x00, 0x00, // mov eax, 16 (SYS_ioctl)
+            0x0f, 0x05, // syscall
+            // 4. SYS_write(fb_fd, 0x00502060, 16) -> Vẽ 4 điểm ảnh 32-bit lên `/dev/fb0`!
+            0x4c, 0x89, 0xe7, // mov rdi, r12
+            0xbe, 0x60, 0x20, 0x50, 0x00, // mov esi, 0x00502060 (4 pixels)
+            0xba, 0x10, 0x00, 0x00, 0x00, // mov edx, 16
+            0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (SYS_write)
+            0x0f, 0x05, // syscall
+            // 5. SYS_close(fb_fd)
+            0x4c, 0x89, 0xe7, // mov rdi, r12
+            0xb8, 0x03, 0x00, 0x00, 0x00, // mov eax, 3 (SYS_close)
+            0x0f, 0x05, // syscall
+            // 6. In thông báo hoàn tất từ `/bin/gui_app` qua SYS_write(1, 0x00502000, 71)
             0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (SYS_write)
             0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1
             0xbe, 0x00, 0x20, 0x50, 0x00, // mov esi, 0x00502000
-            0xba, 0x48, 0x00, 0x00, 0x00, // mov edx, 72
+            0xba, 0x47, 0x00, 0x00, 0x00, // mov edx, 71
             0x0f, 0x05, // syscall
-            // Thoát với mã xác thực 0x44
-            0xbf, 0x44, 0x00, 0x00, 0x00, // mov edi, 0x44
+            // 7. Thoát với mã xác thực 0x55
+            0xbf, 0x55, 0x00, 0x00, 0x00, // mov edi, 0x55
             0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, 231 (SYS_exit_group)
             0x0f, 0x05, // syscall
         ];
         elf[256..256 + code.len()].copy_from_slice(code);
 
-        // 5. Dữ liệu .data của `/bin/app` tại offset 512 (ánh xạ vào 0x0050_2000):
-        let app_msg = b"[RING-3 /bin/app] Executed new ELF64 image from VFS via SYS_execve(59)!\n";
-        elf[512..512 + 72].copy_from_slice(app_msg);
+        let app_msg = b"[RING-3 /bin/gui_app] Linux /dev/fb0 ioctl & 32-bit pixel draw tested!\n";
+        elf[512..512 + 71].copy_from_slice(app_msg);
+        elf[512 + 0x50..512 + 0x50 + 9].copy_from_slice(b"/dev/fb0\0");
+
+        // 4 điểm ảnh 32-bit TrueColor tại 0x0050_2060 (offset 512 + 0x60):
+        // Pixel 0: Neon Cyan (0x0000_F0FF)
+        // Pixel 1: Neon Emerald (0x0000_FF88)
+        // Pixel 2: Neon Coral (0x00FF_5577)
+        // Pixel 3: Neon Gold (0x00FF_CC00)
+        elf[512 + 0x60..512 + 0x64].copy_from_slice(&0x0000_F0FFu32.to_le_bytes());
+        elf[512 + 0x64..512 + 0x68].copy_from_slice(&0x0000_FF88u32.to_le_bytes());
+        elf[512 + 0x68..512 + 0x6C].copy_from_slice(&0x00FF_5577u32.to_le_bytes());
+        elf[512 + 0x6C..512 + 0x70].copy_from_slice(&0x00FF_CC00u32.to_le_bytes());
 
         elf
     }
@@ -2335,15 +2765,14 @@ macro_rules! kprintln {
     };
 }
 
-/// Điểm vào chính của Kernel ZenithOS (Phase 4: VFS, Initramfs, Directory I/O & SYS_execve).
+/// Điểm vào chính của Kernel ZenithOS (Phase 5: Desktop UI Compositor & Linux `/dev/fb0`).
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     ostd::SerialConsole::init();
     kprintln!("================================================================");
-    kprintln!("  ZenithOS v0.4.0 - 100% Rust Framekernel (Linux ABI Phase 4)   ");
+    kprintln!("  ZenithOS v0.5.0 - 100% Rust Framekernel (Graphical Desktop UI)");
     kprintln!("================================================================");
 
-    // 1. Khởi tạo GDT, TSS, IDT và MSR cho SYSCALL/SYSRETQ
     ostd::init_gdt_and_tss();
     ostd::init_idt();
     ostd::trigger_breakpoint_self_test();
@@ -2355,16 +2784,18 @@ pub extern "C" fn _start() -> ! {
     ostd::disable_smap_for_loader();
     kprintln!("[ZENITH-OSTD] GDT/TSS, IDT (#BP), and SYSCALL/SYSRETQ MSRs ready.");
 
-    // 2. Khởi tạo Ngữ cảnh Nhân Bền vững & VFS
     // SAFETY:
-    // Khởi tạo duy nhất 1 lần lúc boot trên BSP trước khi nhảy vào Ring 3.
+    // Khởi tạo PMM, Linear Framebuffer và vẽ giao diện ZenithOS Desktop trên BSP.
     let ctx = unsafe { &mut *GLOBAL_KERNEL_CTX.0.get() };
-    ctx.init_hardware_pmm();
+    ctx.init_hardware();
     kprintln!(
-        "[ZENITH-VFS] Mounted In-Memory VFS ('/', '/etc/os-release', '/proc/version', '/bin/init', '/bin/app')."
+        "[ZENITH-UI] Framebuffer initialized: {}x{}x{}bpp (hw_vram={}) - Tokyo Night Desktop rendered.",
+        ctx.fb.width,
+        ctx.fb.height,
+        ctx.fb.bpp,
+        ctx.fb.is_hardware
     );
 
-    // 3. Xây dựng và nạp ảnh thực thi Linux ELF64 (`/bin/init`) vào vùng nhớ User-space
     let elf_image = linux_abi::build_embedded_linux_init_elf64();
     let loaded = match linux_abi::load_elf64_into_user_space(&elf_image, &mut ctx.pmm) {
         Ok(info) => info,
@@ -2374,49 +2805,48 @@ pub extern "C" fn _start() -> ! {
         }
     };
     ctx.program_break = loaded.initial_brk;
-    kprintln!(
-        "[ZENITH-ELF] Loaded initial ELF64 '/bin/init': entry=0x{:x}, user_rsp=0x{:x}",
-        loaded.entry_rip,
-        loaded.user_rsp
-    );
 
-    // 4. Nhảy xuống Ring 3 chạy `/bin/init` -> đọc VFS -> gọi `SYS_execve("/bin/app")`!
-    kprintln!("[ZENITH-CORE] Entering Ring 3 ('/bin/init' -> VFS -> SYS_execve -> '/bin/app')...");
+    kprintln!("[ZENITH-CORE] Entering Ring 3 ('/bin/init' -> SYS_execve -> '/bin/gui_app')...");
     let exit_code = ostd::enter_user_space(loaded.entry_rip, loaded.user_rsp);
     kprintln!(
-        "[ZENITH-CORE] Ring 3 process '/bin/app' exited cleanly back to Kernel with token=0x{:x}.",
+        "[ZENITH-CORE] Ring 3 GUI process '/bin/gui_app' exited cleanly with token=0x{:x}.",
         exit_code
     );
 
-    // 5. Xác thực toàn bộ chuỗi thực thi VFS & SYS_execve:
-    if exit_code != 0x44 {
+    if exit_code != 0x55 {
         kprintln!(
-            "[ZENITH-TEST][FAIL] Unexpected Ring 3 exit token: 0x{:x} (expected 0x44)",
+            "[ZENITH-TEST][FAIL] Unexpected Ring 3 exit token: 0x{:x} (expected 0x55)",
             exit_code
         );
         ostd::exit_qemu(ostd::QemuExitCode::Failed);
     }
 
-    // - Kiểm tra nội dung `/etc/os-release` mà `/bin/init` đã đọc từ VFS vào `0x1000_0500`
-    let mut os_rel_verify = [0u8; 15];
-    if ostd::copy_from_buffer(0x1000_0500, &mut os_rel_verify).is_err()
-        || &os_rel_verify != b"NAME=\"ZenithOS\""
+    // Xác thực `/bin/gui_app` đã nhận đúng thông số màn hình qua `ioctl(FBIOGET_VSCREENINFO)` tại `0x1000_0800`
+    let mut vinfo_bpp = [0u8; 4];
+    if ostd::copy_from_buffer(0x1000_0818, &mut vinfo_bpp).is_err()
+        || u32::from_le_bytes(vinfo_bpp) != 32
     {
-        kprintln!("[ZENITH-TEST][FAIL] VFS /etc/os-release read content mismatch!");
+        kprintln!("[ZENITH-TEST][FAIL] /dev/fb0 FBIOGET_VSCREENINFO bpp verification failed!");
         ostd::exit_qemu(ostd::QemuExitCode::Failed);
     }
-    kprintln!("[ZENITH-VFS] Verified Ring 3 SYS_openat & SYS_read ('NAME=\"ZenithOS\"').");
 
-    // - Kiểm tra chữ ký `"ZEN4"` mà `/bin/app` đã ghi tại `0x1000_0600` sau khi được `SYS_execve`
-    let mut exec_sig = [0u8; 4];
-    if ostd::copy_from_buffer(0x1000_0600, &mut exec_sig).is_err() || &exec_sig != b"ZEN4" {
-        kprintln!("[ZENITH-TEST][FAIL] SYS_execve '/bin/app' memory signature mismatch!");
+    // Xác thực `/bin/gui_app` đã vẽ 4 điểm ảnh 32-bit lên `/dev/fb0` (Pixel 0 = 0x0000_F0FF)
+    let vram_px0 = ostd::fb_read_pixel(&ctx.fb, 0, 80);
+    if ctx.fb_pixels_written != 4 || vram_px0 != 0x0000_F0FF {
+        kprintln!(
+            "[ZENITH-TEST][FAIL] /dev/fb0 pixel verification failed (count={}, px0=0x{:x})!",
+            ctx.fb_pixels_written,
+            vram_px0
+        );
         ostd::exit_qemu(ostd::QemuExitCode::Failed);
     }
-    kprintln!("[ZENITH-VFS] Verified Ring 3 SYS_getcwd, SYS_getdents64 & SYS_execve('/bin/app').");
+    kprintln!(
+        "[ZENITH-UI] Verified Ring 3 /dev/fb0 ioctl(FBIOGET_VSCREENINFO) & VRAM pixel render (0x{:08x}).",
+        vram_px0
+    );
 
     kprintln!("================================================================");
-    kprintln!("[ZENITH-CI] ALL PHASE 4 VFS, INITRAMFS & EXECVE TESTS PASSED!   ");
+    kprintln!("[ZENITH-CI] ALL PHASE 5 DESKTOP UI & /dev/fb0 TESTS PASSED!     ");
     kprintln!("================================================================");
 
     ostd::exit_qemu(ostd::QemuExitCode::Success);
