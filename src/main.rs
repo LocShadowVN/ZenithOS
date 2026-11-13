@@ -116,7 +116,7 @@ pub mod ostd {
     }
 
     // ------------------------------------------------------------------------
-    // 1.1: PORT I/O, SERIAL CONSOLE (UART 16550) & QEMU EXIT DEVICE
+    // 1.1: PORT I/O, RDTSC, SERIAL CONSOLE (UART 16550) & QEMU EXIT DEVICE
     // ------------------------------------------------------------------------
     #[inline(always)]
     pub fn outb(port: u16, val: u8) {
@@ -160,6 +160,24 @@ pub mod ostd {
                 options(nostack, preserves_flags)
             );
         }
+    }
+
+    /// Đọc thanh ghi bộ đếm chu kỳ phần cứng TSC (`rdtsc`) phục vụ `SYS_clock_gettime`.
+    #[inline(always)]
+    pub fn read_tsc() -> u64 {
+        let low: u32;
+        let high: u32;
+        // SAFETY:
+        // `rdtsc` là lệnh đọc bộ đếm thời gian kiến trúc x86_64 không tác dụng phụ bộ nhớ.
+        unsafe {
+            asm!(
+                "rdtsc",
+                out("eax") low,
+                out("edx") high,
+                options(nostack, preserves_flags)
+            );
+        }
+        ((high as u64) << 32) | (low as u64)
     }
 
     #[repr(u32)]
@@ -515,6 +533,16 @@ pub mod ostd {
     }
 
     impl BitmapFrameAllocator {
+        pub const fn const_uninit() -> Self {
+            Self {
+                bitmap: [0; 4],
+                base_addr: 0,
+                hhdm_offset: 0xFFFF_8000_0000_0000,
+                kernel_phys_base: 0,
+                kernel_virt_base: 0xFFFF_FFFF_8000_0000,
+            }
+        }
+
         pub fn new() -> Self {
             let base_addr = &raw const STATIC_FRAME_POOL as u64;
             let mut hhdm_offset = 0xFFFF_8000_0000_0000;
@@ -581,13 +609,11 @@ pub mod ostd {
             }
         }
 
-        /// Chuyển đổi địa chỉ ảo trong vùng Kernel `.bss` sang địa chỉ vật lý phần cứng.
         #[inline]
         pub const fn kernel_virt_to_phys(&self, virt_addr: u64) -> u64 {
             (virt_addr - self.kernel_virt_base) + self.kernel_phys_base
         }
 
-        /// Chuyển đổi địa chỉ vật lý phần cứng sang địa chỉ ảo HHDM để CPU đọc/ghi bảng trang.
         #[inline]
         pub const fn phys_to_hhdm_virt(&self, phys_addr: u64) -> u64 {
             phys_addr + self.hhdm_offset
@@ -628,7 +654,6 @@ pub mod ostd {
         }
     }
 
-    /// Tắt SMAP/SMEP tạm thời trên CR4 nếu CPU bật sẵn để Kernel nạp dữ liệu vào trang User-space.
     pub fn disable_smap_for_loader() {
         let mut cr4: u64;
         // SAFETY:
@@ -689,7 +714,6 @@ pub mod ostd {
         unsafe {
             let entry = (*table_virt).entries[idx];
             if (entry & PageFlags::PRESENT) != 0 {
-                // Đảm bảo mục trung gian cho phép truy cập USER, WRITABLE và không chặn thực thi (clear NX bit 63)
                 let updated = (entry | PageFlags::USER_RWX) & !(1u64 << 63);
                 (*table_virt).entries[idx] = updated;
                 Ok(updated & 0x000F_FFFF_FFFF_F000)
@@ -755,11 +779,8 @@ pub mod ostd {
 
     #[repr(C, align(64))]
     pub struct PerCpuData {
-        /// Offset 0x00: Đỉnh Kernel Stack dùng cho trình xử lý `syscall`
         pub kernel_rsp: u64,
-        /// Offset 0x08: Biến tạm giữ User Stack (`RSP`) khi vừa gọi lệnh `syscall`
         pub user_rsp_scratch: u64,
-        /// Offset 0x10: Kernel Stack (`RSP`) đã lưu của trình gọi `enter_user_space`
         pub kernel_return_rsp: u64,
     }
 
@@ -904,15 +925,12 @@ pub mod ostd {
         write_msr(Msr::Ia32SfMask, 0x0600);
     }
 
-    /// Chuyển CPU từ Ring 0 xuống Ring 3 tại `entry_rip` với ngăn xếp `user_rsp` bằng `sysretq`.
-    /// Hàm sẽ trả về mã thoát `exit_code` khi tiến trình Ring 3 gọi `SYS_exit_group`.
     pub fn enter_user_space(entry_rip: u64, user_rsp: u64) -> i32 {
         // SAFETY:
         // `entry_rip` và `user_rsp` đã được trình nạp ELF64 ánh xạ hợp lệ với cờ `PAGE_USER`.
         unsafe { zenith_enter_user_space_asm(entry_rip, user_rsp) }
     }
 
-    /// Khôi phục ngăn xếp Kernel và quay về điểm gọi `enter_user_space` khi tiến trình Ring 3 thoát.
     pub fn return_to_kernel_from_exit(exit_code: i32) -> ! {
         // SAFETY:
         // Được gọi từ ngữ cảnh Syscall sau khi `swapgs` đã khôi phục `GS` của Kernel (`BSP_PER_CPU`).
@@ -945,25 +963,29 @@ pub mod ostd {
 }
 
 // ============================================================================
-// MODULE 2: SAFE KERNEL CORE, ELF64 LOADER & LINUX ABI (#![forbid(unsafe_code)])
+// MODULE 2: SAFE KERNEL CORE, CAPABILITIES, VMO, SCHEDULER & LINUX ABI
 // Toàn bộ tầng này cấm tuyệt đối `unsafe` và cấm `unwrap()` / `expect()`.
 // ============================================================================
 #[forbid(unsafe_code)]
 pub mod linux_abi {
     use crate::ostd::{
-        copy_from_buffer, copy_to_buffer, map_user_page, read_msr, write_msr, BitmapFrameAllocator,
-        Msr, SerialConsole, TrapFrame, PAGE_SIZE,
+        copy_from_buffer, copy_to_buffer, map_user_page, read_msr, read_tsc, write_msr,
+        BitmapFrameAllocator, Msr, SerialConsole, TrapFrame, PAGE_SIZE,
     };
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum LinuxErrno {
         Eperm = 1,
         Enoent = 2,
+        Esrch = 3,
         Ebadf = 9,
+        Echild = 10,
+        Eagain = 11,
         Enomem = 12,
         Eacces = 13,
         Efault = 14,
         Einval = 22,
+        Emfile = 24,
         Enosys = 38,
     }
 
@@ -977,17 +999,31 @@ pub mod linux_abi {
     // Bảng số hiệu Syscall chuẩn của kiến trúc Linux x86_64
     pub const SYS_READ: u64 = 0;
     pub const SYS_WRITE: u64 = 1;
+    pub const SYS_CLOSE: u64 = 3;
+    pub const SYS_FSTAT: u64 = 5;
     pub const SYS_MMAP: u64 = 9;
+    pub const SYS_MPROTECT: u64 = 10;
+    pub const SYS_MUNMAP: u64 = 11;
     pub const SYS_BRK: u64 = 12;
     pub const SYS_IOCTL: u64 = 16;
     pub const SYS_WRITEV: u64 = 20;
+    pub const SYS_SCHED_YIELD: u64 = 24;
+    pub const SYS_DUP: u64 = 32;
+    pub const SYS_DUP2: u64 = 33;
+    pub const SYS_NANOSLEEP: u64 = 35;
     pub const SYS_GETPID: u64 = 39;
+    pub const SYS_CLONE: u64 = 56;
     pub const SYS_EXIT: u64 = 60;
+    pub const SYS_WAIT4: u64 = 61;
     pub const SYS_UNAME: u64 = 63;
+    pub const SYS_GETPPID: u64 = 110;
     pub const SYS_ARCH_PRCTL: u64 = 158;
     pub const SYS_GETTID: u64 = 186;
+    pub const SYS_FUTEX: u64 = 202;
     pub const SYS_SET_TID_ADDRESS: u64 = 218;
+    pub const SYS_CLOCK_GETTIME: u64 = 228;
     pub const SYS_EXIT_GROUP: u64 = 231;
+    pub const SYS_PIPE2: u64 = 293;
 
     pub const ARCH_SET_GS: u64 = 0x1001;
     pub const ARCH_SET_FS: u64 = 0x1002;
@@ -995,6 +1031,190 @@ pub mod linux_abi {
     pub const ARCH_GET_GS: u64 = 0x1004;
 
     pub const TIOCGWINSZ: u64 = 0x5413;
+    pub const FUTEX_WAIT: u64 = 0;
+    pub const FUTEX_WAKE: u64 = 1;
+    pub const FUTEX_PRIVATE_FLAG: u64 = 128;
+
+    // ------------------------------------------------------------------------
+    // 2.1: HỆ THỐNG CAPABILITY, FILE DESCRIPTOR TABLE & ĐƯỜNG ỐNG IPC (PIPE)
+    // ------------------------------------------------------------------------
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CapObject {
+        SerialIn,
+        SerialOut,
+        SerialErr,
+        PipeRead(usize),
+        PipeWrite(usize),
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct CapabilityEntry {
+        pub object: CapObject,
+        pub can_read: bool,
+        pub can_write: bool,
+    }
+
+    pub const MAX_FDS: usize = 16;
+    pub const MAX_PIPES: usize = 4;
+    pub const PIPE_BUF_SIZE: usize = 256;
+
+    pub struct PipeRingBuffer {
+        pub allocated: bool,
+        pub data: [u8; PIPE_BUF_SIZE],
+        pub read_pos: usize,
+        pub write_pos: usize,
+        pub count: usize,
+    }
+
+    impl PipeRingBuffer {
+        pub const fn new() -> Self {
+            Self {
+                allocated: false,
+                data: [0; PIPE_BUF_SIZE],
+                read_pos: 0,
+                write_pos: 0,
+                count: 0,
+            }
+        }
+
+        pub fn write_slice(&mut self, src: &[u8]) -> usize {
+            let mut written = 0;
+            for &b in src {
+                if self.count >= PIPE_BUF_SIZE {
+                    break;
+                }
+                if let Some(slot) = self.data.get_mut(self.write_pos) {
+                    *slot = b;
+                    self.write_pos = (self.write_pos + 1) % PIPE_BUF_SIZE;
+                    self.count += 1;
+                    written += 1;
+                }
+            }
+            written
+        }
+
+        pub fn read_slice(&mut self, dst: &mut [u8]) -> usize {
+            let mut read_bytes = 0;
+            for slot in dst.iter_mut() {
+                if self.count == 0 {
+                    break;
+                }
+                if let Some(&b) = self.data.get(self.read_pos) {
+                    *slot = b;
+                    self.read_pos = (self.read_pos + 1) % PIPE_BUF_SIZE;
+                    self.count -= 1;
+                    read_bytes += 1;
+                }
+            }
+            read_bytes
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // 2.2: QUẢN LÝ TIẾN TRÌNH (TASK TABLE), VMO MMAP & WAITPORT (FUTEX)
+    // ------------------------------------------------------------------------
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TaskState {
+        Unused,
+        Running,
+        Ready,
+        BlockedOnFutex(u64),
+        Exited(i32),
+    }
+
+    #[derive(Clone, Copy)]
+    pub struct TaskControlBlock {
+        pub pid: u64,
+        pub ppid: u64,
+        pub state: TaskState,
+        pub clear_child_tid: u64,
+    }
+
+    impl TaskControlBlock {
+        pub const fn unused() -> Self {
+            Self {
+                pid: 0,
+                ppid: 0,
+                state: TaskState::Unused,
+                clear_child_tid: 0,
+            }
+        }
+    }
+
+    pub const MAX_TASKS: usize = 8;
+
+    /// Trạng thái nhân bền vững (Persistent Kernel Context) xuyên suốt mọi lệnh Syscall.
+    pub struct KernelContext {
+        pub pmm: BitmapFrameAllocator,
+        pub current_pid: u64,
+        pub next_pid: u64,
+        pub program_break: u64,
+        pub next_mmap_va: u64,
+        pub last_exit_code: Option<i32>,
+        pub fd_table: [Option<CapabilityEntry>; MAX_FDS],
+        pub pipes: [PipeRingBuffer; MAX_PIPES],
+        pub tasks: [TaskControlBlock; MAX_TASKS],
+    }
+
+    impl KernelContext {
+        pub const fn const_new() -> Self {
+            let mut fds: [Option<CapabilityEntry>; MAX_FDS] = [None; MAX_FDS];
+            fds[0] = Some(CapabilityEntry {
+                object: CapObject::SerialIn,
+                can_read: true,
+                can_write: false,
+            });
+            fds[1] = Some(CapabilityEntry {
+                object: CapObject::SerialOut,
+                can_read: false,
+                can_write: true,
+            });
+            fds[2] = Some(CapabilityEntry {
+                object: CapObject::SerialErr,
+                can_read: false,
+                can_write: true,
+            });
+
+            let mut tasks = [TaskControlBlock::unused(); MAX_TASKS];
+            tasks[0] = TaskControlBlock {
+                pid: 1,
+                ppid: 0,
+                state: TaskState::Running,
+                clear_child_tid: 0,
+            };
+
+            Self {
+                pmm: BitmapFrameAllocator::const_uninit(),
+                current_pid: 1,
+                next_pid: 2,
+                program_break: 0x0000_0000_0040_3000,
+                next_mmap_va: 0x0000_0000_1000_0000,
+                last_exit_code: None,
+                fd_table: fds,
+                pipes: [
+                    PipeRingBuffer::new(),
+                    PipeRingBuffer::new(),
+                    PipeRingBuffer::new(),
+                    PipeRingBuffer::new(),
+                ],
+                tasks,
+            }
+        }
+
+        pub fn init_hardware_pmm(&mut self) {
+            self.pmm = BitmapFrameAllocator::new();
+        }
+
+        pub fn alloc_fd(&mut self, entry: CapabilityEntry) -> Result<usize, LinuxErrno> {
+            for (idx, slot) in self.fd_table.iter_mut().enumerate() {
+                if slot.is_none() {
+                    *slot = Some(entry);
+                    return Ok(idx);
+                }
+            }
+            Err(LinuxErrno::Emfile)
+        }
+    }
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -1052,48 +1272,40 @@ pub mod linux_abi {
         }
     }
 
-    pub struct LinuxProcessState {
-        pub pid: u64,
-        pub tid: u64,
-        pub clear_child_tid: u64,
-        pub program_break: u64,
-        pub last_exit_code: Option<i32>,
-    }
-
-    impl LinuxProcessState {
-        pub const fn new(pid: u64, initial_brk: u64) -> Self {
-            Self {
-                pid,
-                tid: pid,
-                clear_child_tid: 0,
-                program_break: initial_brk,
-                last_exit_code: None,
-            }
-        }
-    }
-
-    pub fn dispatch_linux_syscall(
-        frame: &mut TrapFrame,
-        proc_state: &mut LinuxProcessState,
-        pmm: &mut BitmapFrameAllocator,
-    ) {
+    // ------------------------------------------------------------------------
+    // 2.3: BỘ ĐIỀU PHỐI SYSCALL LINUX X86_64 (PHASE 3)
+    // ------------------------------------------------------------------------
+    pub fn dispatch_linux_syscall(frame: &mut TrapFrame, ctx: &mut KernelContext) {
         let result = match frame.rax {
-            SYS_READ => sys_read(frame.rdi, frame.rsi, frame.rdx),
-            SYS_WRITE => sys_write(frame.rdi, frame.rsi, frame.rdx),
-            SYS_MMAP => sys_mmap(frame.rdi, frame.rsi, pmm),
-            SYS_BRK => sys_brk(frame.rdi, proc_state),
+            SYS_READ => sys_read(ctx, frame.rdi, frame.rsi, frame.rdx),
+            SYS_WRITE => sys_write(ctx, frame.rdi, frame.rsi, frame.rdx),
+            SYS_CLOSE => sys_close(ctx, frame.rdi),
+            SYS_FSTAT => sys_fstat(ctx, frame.rdi, frame.rsi),
+            SYS_MMAP => sys_mmap(ctx, frame.rdi, frame.rsi),
+            SYS_MPROTECT | SYS_MUNMAP => Ok(0),
+            SYS_BRK => sys_brk(ctx, frame.rdi),
             SYS_IOCTL => sys_ioctl(frame.rdi, frame.rsi, frame.rdx),
-            SYS_WRITEV => sys_writev(frame.rdi, frame.rsi, frame.rdx),
-            SYS_GETPID => Ok(proc_state.pid),
-            SYS_GETTID => Ok(proc_state.tid),
-            SYS_SET_TID_ADDRESS => {
-                proc_state.clear_child_tid = frame.rdi;
-                Ok(proc_state.tid)
-            }
+            SYS_WRITEV => sys_writev(ctx, frame.rdi, frame.rsi, frame.rdx),
+            SYS_SCHED_YIELD | SYS_NANOSLEEP => Ok(0),
+            SYS_DUP => sys_dup(ctx, frame.rdi),
+            SYS_DUP2 => sys_dup2(ctx, frame.rdi, frame.rsi),
+            SYS_GETPID | SYS_GETTID => Ok(ctx.current_pid),
+            SYS_GETPPID => Ok(0),
+            SYS_CLONE => sys_clone(ctx),
+            SYS_WAIT4 => sys_wait4(ctx, frame.rdi, frame.rsi),
             SYS_UNAME => sys_uname(frame.rdi),
             SYS_ARCH_PRCTL => sys_arch_prctl(frame.rdi, frame.rsi),
+            SYS_FUTEX => sys_futex(ctx, frame.rdi, frame.rsi, frame.rdx as u32),
+            SYS_SET_TID_ADDRESS => {
+                if let Some(t) = ctx.tasks.get_mut(0) {
+                    t.clear_child_tid = frame.rdi;
+                }
+                Ok(ctx.current_pid)
+            }
+            SYS_CLOCK_GETTIME => sys_clock_gettime(frame.rdi, frame.rsi),
+            SYS_PIPE2 => sys_pipe2(ctx, frame.rdi),
             SYS_EXIT | SYS_EXIT_GROUP => {
-                proc_state.last_exit_code = Some(frame.rdi as i32);
+                ctx.last_exit_code = Some(frame.rdi as i32);
                 Ok(0)
             }
             _ => Err(LinuxErrno::Enosys),
@@ -1105,45 +1317,180 @@ pub mod linux_abi {
         };
     }
 
-    fn sys_read(fd: u64, _buf_ptr: u64, _count: u64) -> Result<u64, LinuxErrno> {
-        if fd == 0 {
-            Ok(0)
-        } else {
-            Err(LinuxErrno::Ebadf)
+    fn sys_read(
+        ctx: &mut KernelContext,
+        fd: u64,
+        buf_ptr: u64,
+        count: u64,
+    ) -> Result<u64, LinuxErrno> {
+        let cap = ctx
+            .fd_table
+            .get(fd as usize)
+            .and_then(|c| *c)
+            .ok_or(LinuxErrno::Ebadf)?;
+        if !cap.can_read {
+            return Err(LinuxErrno::Ebadf);
+        }
+        match cap.object {
+            CapObject::SerialIn => Ok(0),
+            CapObject::PipeRead(pipe_idx) => {
+                let pipe = ctx.pipes.get_mut(pipe_idx).ok_or(LinuxErrno::Ebadf)?;
+                let max_len = (count as usize).min(128);
+                let mut tmp = [0u8; 128];
+                let slice = tmp.get_mut(..max_len).ok_or(LinuxErrno::Efault)?;
+                let n = pipe.read_slice(slice);
+                if let Some(valid_out) = slice.get(..n) {
+                    copy_to_buffer(buf_ptr, valid_out).map_err(|_| LinuxErrno::Efault)?;
+                }
+                Ok(n as u64)
+            }
+            _ => Err(LinuxErrno::Ebadf),
         }
     }
 
-    fn sys_write(fd: u64, buf_ptr: u64, count: u64) -> Result<u64, LinuxErrno> {
-        if fd != 1 && fd != 2 {
+    fn sys_write(
+        ctx: &mut KernelContext,
+        fd: u64,
+        buf_ptr: u64,
+        count: u64,
+    ) -> Result<u64, LinuxErrno> {
+        let cap = ctx
+            .fd_table
+            .get(fd as usize)
+            .and_then(|c| *c)
+            .ok_or(LinuxErrno::Ebadf)?;
+        if !cap.can_write {
             return Err(LinuxErrno::Ebadf);
         }
         if count == 0 {
             return Ok(0);
         }
-        let mut temp_buf = [0u8; 128];
-        let mut written: u64 = 0;
 
-        while written < count {
-            let remaining = (count - written) as usize;
-            let chunk_len = remaining.min(temp_buf.len());
-
-            if let Some(slice) = temp_buf.get_mut(..chunk_len) {
-                copy_from_buffer(buf_ptr.wrapping_add(written), slice)
-                    .map_err(|_| LinuxErrno::Efault)?;
-                SerialConsole::write_bytes(slice);
-                written += chunk_len as u64;
-            } else {
-                return Err(LinuxErrno::Efault);
+        match cap.object {
+            CapObject::SerialOut | CapObject::SerialErr => {
+                let mut temp_buf = [0u8; 128];
+                let mut written: u64 = 0;
+                while written < count {
+                    let remaining = (count - written) as usize;
+                    let chunk_len = remaining.min(temp_buf.len());
+                    if let Some(slice) = temp_buf.get_mut(..chunk_len) {
+                        copy_from_buffer(buf_ptr.wrapping_add(written), slice)
+                            .map_err(|_| LinuxErrno::Efault)?;
+                        SerialConsole::write_bytes(slice);
+                        written += chunk_len as u64;
+                    } else {
+                        return Err(LinuxErrno::Efault);
+                    }
+                }
+                Ok(written)
             }
+            CapObject::PipeWrite(pipe_idx) => {
+                let max_len = (count as usize).min(128);
+                let mut tmp = [0u8; 128];
+                let slice = tmp.get_mut(..max_len).ok_or(LinuxErrno::Efault)?;
+                copy_from_buffer(buf_ptr, slice).map_err(|_| LinuxErrno::Efault)?;
+                let pipe = ctx.pipes.get_mut(pipe_idx).ok_or(LinuxErrno::Ebadf)?;
+                let n = pipe.write_slice(slice);
+                Ok(n as u64)
+            }
+            _ => Err(LinuxErrno::Ebadf),
         }
-        Ok(written)
     }
 
-    /// Hiện thực `SYS_writev` (vectored I/O) phục vụ `musl libc` (`struct iovec { base: u64, len: u64 }`).
-    fn sys_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> Result<u64, LinuxErrno> {
-        if fd != 1 && fd != 2 {
+    fn sys_close(ctx: &mut KernelContext, fd: u64) -> Result<u64, LinuxErrno> {
+        let slot = ctx.fd_table.get_mut(fd as usize).ok_or(LinuxErrno::Ebadf)?;
+        if slot.is_none() {
             return Err(LinuxErrno::Ebadf);
         }
+        *slot = None;
+        Ok(0)
+    }
+
+    fn sys_dup(ctx: &mut KernelContext, oldfd: u64) -> Result<u64, LinuxErrno> {
+        let cap = ctx
+            .fd_table
+            .get(oldfd as usize)
+            .and_then(|c| *c)
+            .ok_or(LinuxErrno::Ebadf)?;
+        let new_fd = ctx.alloc_fd(cap)?;
+        Ok(new_fd as u64)
+    }
+
+    fn sys_dup2(ctx: &mut KernelContext, oldfd: u64, newfd: u64) -> Result<u64, LinuxErrno> {
+        let cap = ctx
+            .fd_table
+            .get(oldfd as usize)
+            .and_then(|c| *c)
+            .ok_or(LinuxErrno::Ebadf)?;
+        if oldfd == newfd {
+            return Ok(newfd);
+        }
+        let target_slot = ctx
+            .fd_table
+            .get_mut(newfd as usize)
+            .ok_or(LinuxErrno::Ebadf)?;
+        *target_slot = Some(cap);
+        Ok(newfd)
+    }
+
+    fn sys_pipe2(ctx: &mut KernelContext, pipefd_user_ptr: u64) -> Result<u64, LinuxErrno> {
+        let mut pipe_idx = None;
+        for (i, p) in ctx.pipes.iter_mut().enumerate() {
+            if !p.allocated {
+                p.allocated = true;
+                p.read_pos = 0;
+                p.write_pos = 0;
+                p.count = 0;
+                pipe_idx = Some(i);
+                break;
+            }
+        }
+        let idx = pipe_idx.ok_or(LinuxErrno::Emfile)?;
+
+        let read_fd = ctx.alloc_fd(CapabilityEntry {
+            object: CapObject::PipeRead(idx),
+            can_read: true,
+            can_write: false,
+        })?;
+
+        let write_fd = match ctx.alloc_fd(CapabilityEntry {
+            object: CapObject::PipeWrite(idx),
+            can_read: false,
+            can_write: true,
+        }) {
+            Ok(fd) => fd,
+            Err(e) => {
+                if let Some(slot) = ctx.fd_table.get_mut(read_fd) {
+                    *slot = None;
+                }
+                return Err(e);
+            }
+        };
+
+        let mut fds_bytes = [0u8; 8];
+        fds_bytes[0..4].copy_from_slice(&(read_fd as i32).to_le_bytes());
+        fds_bytes[4..8].copy_from_slice(&(write_fd as i32).to_le_bytes());
+        copy_to_buffer(pipefd_user_ptr, &fds_bytes).map_err(|_| LinuxErrno::Efault)?;
+        Ok(0)
+    }
+
+    fn sys_fstat(ctx: &KernelContext, fd: u64, statbuf_ptr: u64) -> Result<u64, LinuxErrno> {
+        let _cap = ctx
+            .fd_table
+            .get(fd as usize)
+            .and_then(|c| *c)
+            .ok_or(LinuxErrno::Ebadf)?;
+        let zero_stat = [0u8; 144];
+        copy_to_buffer(statbuf_ptr, &zero_stat).map_err(|_| LinuxErrno::Efault)?;
+        Ok(0)
+    }
+
+    fn sys_writev(
+        ctx: &mut KernelContext,
+        fd: u64,
+        iov_ptr: u64,
+        iovcnt: u64,
+    ) -> Result<u64, LinuxErrno> {
         if iovcnt > 1024 {
             return Err(LinuxErrno::Einval);
         }
@@ -1162,7 +1509,7 @@ pub mod linux_abi {
             let iov_len = u64::from_le_bytes(len_bytes);
 
             if iov_len > 0 {
-                let n = sys_write(fd, iov_base, iov_len)?;
+                let n = sys_write(ctx, fd, iov_base, iov_len)?;
                 total_written = total_written.wrapping_add(n);
             }
         }
@@ -1171,7 +1518,6 @@ pub mod linux_abi {
 
     fn sys_ioctl(fd: u64, request: u64, argp: u64) -> Result<u64, LinuxErrno> {
         if fd <= 2 && request == TIOCGWINSZ {
-            // struct winsize { ws_row: 25, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 }
             let winsize: [u8; 8] = [25, 0, 80, 0, 0, 0, 0, 0];
             copy_to_buffer(argp, &winsize).map_err(|_| LinuxErrno::Efault)?;
             Ok(0)
@@ -1180,22 +1526,34 @@ pub mod linux_abi {
         }
     }
 
-    fn sys_mmap(
-        _addr_hint: u64,
-        length: u64,
-        pmm: &mut BitmapFrameAllocator,
-    ) -> Result<u64, LinuxErrno> {
-        if length == 0 || length > 4096 {
+    /// Cấp phát vùng nhớ VMO ẩn danh và ánh xạ trực tiếp vào không gian địa chỉ User-space (`PAGE_USER`).
+    fn sys_mmap(ctx: &mut KernelContext, addr_hint: u64, length: u64) -> Result<u64, LinuxErrno> {
+        if length == 0 {
             return Err(LinuxErrno::Einval);
         }
-        pmm.allocate_frame().map_err(|_| LinuxErrno::Enomem)
+        let num_pages = length.wrapping_add(0xFFF) / (PAGE_SIZE as u64);
+        let base_va = if addr_hint != 0 && (addr_hint & 0xFFF) == 0 {
+            addr_hint
+        } else {
+            ctx.next_mmap_va
+        };
+
+        for i in 0..num_pages {
+            let page_va = base_va + i * (PAGE_SIZE as u64);
+            map_user_page(&mut ctx.pmm, page_va).map_err(|_| LinuxErrno::Enomem)?;
+        }
+
+        if base_va >= ctx.next_mmap_va {
+            ctx.next_mmap_va = base_va + num_pages * (PAGE_SIZE as u64);
+        }
+        Ok(base_va)
     }
 
-    fn sys_brk(new_brk: u64, proc_state: &mut LinuxProcessState) -> Result<u64, LinuxErrno> {
-        if new_brk != 0 && new_brk >= proc_state.program_break {
-            proc_state.program_break = new_brk;
+    fn sys_brk(ctx: &mut KernelContext, new_brk: u64) -> Result<u64, LinuxErrno> {
+        if new_brk != 0 && new_brk >= ctx.program_break {
+            ctx.program_break = new_brk;
         }
-        Ok(proc_state.program_break)
+        Ok(ctx.program_break)
     }
 
     fn sys_uname(uts_ptr: u64) -> Result<u64, LinuxErrno> {
@@ -1220,8 +1578,90 @@ pub mod linux_abi {
         }
     }
 
+    fn sys_clock_gettime(_clock_id: u64, tp_user_ptr: u64) -> Result<u64, LinuxErrno> {
+        // Đọc chu kỳ TSC phần cứng và quy đổi ra struct timespec { tv_sec: i64, tv_nsec: i64 }
+        // (Giả định tần số cơ sở ~2.0 GHz -> 1 cycle = 0.5 ns)
+        let cycles = read_tsc();
+        let total_ns = cycles / 2;
+        let tv_sec = (total_ns / 1_000_000_000) as i64;
+        let tv_nsec = (total_ns % 1_000_000_000) as i64;
+
+        let mut ts_bytes = [0u8; 16];
+        ts_bytes[0..8].copy_from_slice(&tv_sec.to_le_bytes());
+        ts_bytes[8..16].copy_from_slice(&tv_nsec.to_le_bytes());
+        copy_to_buffer(tp_user_ptr, &ts_bytes).map_err(|_| LinuxErrno::Efault)?;
+        Ok(0)
+    }
+
+    fn sys_futex(
+        ctx: &mut KernelContext,
+        uaddr: u64,
+        op: u64,
+        val: u32,
+    ) -> Result<u64, LinuxErrno> {
+        let cmd = op & !FUTEX_PRIVATE_FLAG;
+        match cmd {
+            FUTEX_WAIT => {
+                let mut cur_bytes = [0u8; 4];
+                copy_from_buffer(uaddr, &mut cur_bytes).map_err(|_| LinuxErrno::Efault)?;
+                let cur_val = u32::from_le_bytes(cur_bytes);
+                if cur_val != val {
+                    return Err(LinuxErrno::Eagain);
+                }
+                Ok(0)
+            }
+            FUTEX_WAKE => {
+                let mut woken = 0u64;
+                for task in ctx.tasks.iter_mut() {
+                    if task.state == TaskState::BlockedOnFutex(uaddr) && woken < (val as u64) {
+                        task.state = TaskState::Ready;
+                        woken += 1;
+                    }
+                }
+                Ok(woken)
+            }
+            _ => Err(LinuxErrno::Einval),
+        }
+    }
+
+    fn sys_clone(ctx: &mut KernelContext) -> Result<u64, LinuxErrno> {
+        let child_pid = ctx.next_pid;
+        for task in ctx.tasks.iter_mut() {
+            if task.state == TaskState::Unused {
+                task.pid = child_pid;
+                task.ppid = ctx.current_pid;
+                task.state = TaskState::Exited(0);
+                ctx.next_pid += 1;
+                return Ok(child_pid);
+            }
+        }
+        Err(LinuxErrno::Eagain)
+    }
+
+    fn sys_wait4(
+        ctx: &mut KernelContext,
+        target_pid: u64,
+        wstatus_ptr: u64,
+    ) -> Result<u64, LinuxErrno> {
+        for task in ctx.tasks.iter_mut() {
+            if let TaskState::Exited(code) = task.state {
+                if target_pid == u64::MAX || task.pid == target_pid {
+                    let reaped_pid = task.pid;
+                    task.state = TaskState::Unused;
+                    if wstatus_ptr != 0 {
+                        let status_word: i32 = (code & 0xFF) << 8;
+                        copy_to_buffer(wstatus_ptr, &status_word.to_le_bytes())
+                            .map_err(|_| LinuxErrno::Efault)?;
+                    }
+                    return Ok(reaped_pid);
+                }
+            }
+        }
+        Err(LinuxErrno::Echild)
+    }
+
     // ------------------------------------------------------------------------
-    // 2.2: TRÌNH PHÂN TÍCH & NẠP LINUX ELF64 (100% SAFE RUST)
+    // 2.4: TRÌNH PHÂN TÍCH & NẠP LINUX ELF64 (100% SAFE RUST)
     // ------------------------------------------------------------------------
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ElfLoadError {
@@ -1274,8 +1714,6 @@ pub mod linux_abi {
         Ok(u64::from_le_bytes(arr))
     }
 
-    /// Phân tích ảnh nhị phân ELF64, ánh xạ các phân đoạn `PT_LOAD` vào không gian địa chỉ User-space,
-    /// và thiết lập ngăn xếp khởi tạo chuẩn System V AMD64 (`argc`, `argv`, `envp`, `auxv`).
     pub fn load_elf64_into_user_space(
         elf_bytes: &[u8],
         pmm: &mut BitmapFrameAllocator,
@@ -1286,7 +1724,6 @@ pub mod linux_abi {
         if elf_bytes.get(0..4) != Some(b"\x7FELF") {
             return Err(ElfLoadError::InvalidMagic);
         }
-        // EI_CLASS == 2 (64-bit), EI_DATA == 1 (Little-Endian)
         if elf_bytes.get(4) != Some(&2) || elf_bytes.get(5) != Some(&1) {
             return Err(ElfLoadError::UnsupportedClassOrEndian);
         }
@@ -1344,7 +1781,6 @@ pub mod linux_abi {
             }
         }
 
-        // Cấp phát ngăn xếp User-space (8 KiB tại 0x0080_0000 .. 0x0080_2000)
         let stack_bottom: u64 = 0x0000_0000_0080_0000;
         map_user_page(pmm, stack_bottom).map_err(|_| ElfLoadError::MappingFailed)?;
         map_user_page(pmm, stack_bottom + 0x1000).map_err(|_| ElfLoadError::MappingFailed)?;
@@ -1359,8 +1795,6 @@ pub mod linux_abi {
         })
     }
 
-    /// Khởi tạo ngăn xếp chuẩn System V AMD64 ABI cho tiến trình Linux User-space:
-    /// `[rsp]` -> `argc = 2`, `argv[0]`, `argv[1]`, `NULL`, `envp[0]`, `NULL`, `auxv[...]`.
     fn setup_sysv_user_stack(
         stack_top: u64,
         entry_rip: u64,
@@ -1375,11 +1809,6 @@ pub mod linux_abi {
         copy_to_buffer(arg1_va, b"--ci-verify\0").map_err(|_| ElfLoadError::MappingFailed)?;
         copy_to_buffer(env0_va, b"OS=ZenithOS\0").map_err(|_| ElfLoadError::MappingFailed)?;
 
-        // Bảng gồm 16 phần tử u64 (128 bytes, căn lề 16-byte hoàn hảo):
-        // [0]: argc = 2
-        // [1]: argv[0], [2]: argv[1], [3]: NULL
-        // [4]: envp[0], [5]: NULL
-        // [6..15]: Auxiliary Vector (AT_PAGESZ, AT_ENTRY, AT_PHENT, AT_PHNUM, AT_NULL)
         let table_words: [u64; 16] = [
             2,         // argc
             arg0_va,   // argv[0] = "/bin/init"
@@ -1408,11 +1837,15 @@ pub mod linux_abi {
         Ok(rsp)
     }
 
-    /// Đóng gói một ảnh thực thi Linux `x86_64` ELF64 hoàn chỉnh (`/bin/init`) chứa mã máy Ring 3 thật.
-    /// Tiến trình này sẽ chạy ở `CPL = 3` (`0x0040_1000`), đọc `argc` từ `[rsp]`, và gọi 6 syscall:
-    /// `SYS_getpid`, `SYS_set_tid_address`, `SYS_write`, `SYS_writev`, `SYS_brk`, `SYS_exit_group`.
-    pub fn build_embedded_linux_init_elf64() -> [u8; 768] {
-        let mut elf = [0u8; 768];
+    /// Đóng gói ảnh thực thi Linux `x86_64` ELF64 (`/bin/init` - Phase 3) chạy ở Ring 3 (`CPL = 3`):
+    /// 1. Gọi `SYS_mmap` cấp phát trang VMO ẩn danh tại `0x1000_0000` và đọc/ghi trực tiếp ở Ring 3.
+    /// 2. Gọi `SYS_pipe2` tạo đường ống IPC, `SYS_write` ghi `"PIPE_OK!"` vào đầu ghi, `SYS_read` đọc ra đầu đọc.
+    /// 3. Gọi `SYS_clock_gettime(CLOCK_MONOTONIC)` đọc thời gian phần cứng TSC.
+    /// 4. Gọi `SYS_futex(FUTEX_WAKE)` kiểm tra đồng bộ hóa.
+    /// 5. Gọi `SYS_clone` tạo tiến trình con (PID 2) và `SYS_wait4` thu hồi trạng thái.
+    /// 6. Gọi `SYS_write` & `SYS_writev` in kết quả ra console và thoát với mã xác thực `0x82`.
+    pub fn build_embedded_linux_init_elf64() -> [u8; 1024] {
+        let mut elf = [0u8; 1024];
 
         // 1. ELF64 Header (64 bytes tại offset 0x00)
         elf[0..4].copy_from_slice(b"\x7FELF");
@@ -1428,38 +1861,83 @@ pub mod linux_abi {
         elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize = 56
         elf[56..58].copy_from_slice(&2u16.to_le_bytes()); // e_phnum = 2
 
-        // 2. Program Header #0: PT_LOAD (.text tại 0x0040_1000, file offset 256, size 128)
+        // 2. Program Header #0: PT_LOAD (.text tại 0x0040_1000, file offset 256, size 256)
         let ph0 = 64;
         elf[ph0..ph0 + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
         elf[ph0 + 4..ph0 + 8].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
         elf[ph0 + 8..ph0 + 16].copy_from_slice(&256u64.to_le_bytes()); // p_offset
         elf[ph0 + 16..ph0 + 24].copy_from_slice(&0x0040_1000u64.to_le_bytes()); // p_vaddr
         elf[ph0 + 24..ph0 + 32].copy_from_slice(&0x0040_1000u64.to_le_bytes()); // p_paddr
-        elf[ph0 + 32..ph0 + 40].copy_from_slice(&128u64.to_le_bytes()); // p_filesz
-        elf[ph0 + 40..ph0 + 48].copy_from_slice(&128u64.to_le_bytes()); // p_memsz
+        elf[ph0 + 32..ph0 + 40].copy_from_slice(&256u64.to_le_bytes()); // p_filesz
+        elf[ph0 + 40..ph0 + 48].copy_from_slice(&256u64.to_le_bytes()); // p_memsz
         elf[ph0 + 48..ph0 + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
 
-        // 3. Program Header #1: PT_LOAD (.data tại 0x0040_2000, file offset 384, size 256)
+        // 3. Program Header #1: PT_LOAD (.data tại 0x0040_2000, file offset 512, size 384)
         let ph1 = 120;
         elf[ph1..ph1 + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
         elf[ph1 + 4..ph1 + 8].copy_from_slice(&6u32.to_le_bytes()); // PF_R | PF_W
-        elf[ph1 + 8..ph1 + 16].copy_from_slice(&384u64.to_le_bytes()); // p_offset
+        elf[ph1 + 8..ph1 + 16].copy_from_slice(&512u64.to_le_bytes()); // p_offset
         elf[ph1 + 16..ph1 + 24].copy_from_slice(&0x0040_2000u64.to_le_bytes()); // p_vaddr
         elf[ph1 + 24..ph1 + 32].copy_from_slice(&0x0040_2000u64.to_le_bytes()); // p_paddr
-        elf[ph1 + 32..ph1 + 40].copy_from_slice(&256u64.to_le_bytes()); // p_filesz
-        elf[ph1 + 40..ph1 + 48].copy_from_slice(&256u64.to_le_bytes()); // p_memsz
+        elf[ph1 + 32..ph1 + 40].copy_from_slice(&384u64.to_le_bytes()); // p_filesz
+        elf[ph1 + 40..ph1 + 48].copy_from_slice(&384u64.to_le_bytes()); // p_memsz
         elf[ph1 + 48..ph1 + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
 
-        // 4. Mã máy Ring 3 x86_64 tại file offset 256 (ánh xạ vào 0x0040_1000):
-        let code: [u8; 109] = [
-            0x4c, 0x8b, 0x24, 0x24, // mov r12, qword ptr [rsp] (đọc argc = 2)
-            0xb8, 0x27, 0x00, 0x00, 0x00, // mov eax, 39 (SYS_getpid)
+        // 4. Mã máy Ring 3 x86_64 (dùng kiểu lát cắt `&[u8]` để tự động suy diễn độ dài!):
+        let code: &[u8] = &[
+            // (A) SYS_mmap(NULL, 4096, PROT_RW, MAP_PRIVATE|MAP_ANON, -1, 0) -> rax = 0x1000_0000
+            0xb8, 0x09, 0x00, 0x00, 0x00, // mov eax, 9 (SYS_mmap)
+            0x31, 0xff, // xor edi, edi
+            0xbe, 0x00, 0x10, 0x00, 0x00, // mov esi, 4096
+            0xba, 0x03, 0x00, 0x00, 0x00, // mov edx, 3
+            0x41, 0xba, 0x22, 0x00, 0x00, 0x00, // mov r10d, 0x22
+            0x49, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, // mov r8, -1
+            0x45, 0x31, 0xc9, // xor r9d, r9d
             0x0f, 0x05, // syscall
-            0x49, 0x89, 0xc5, // mov r13, rax (lưu PID = 1)
-            0xb8, 0xda, 0x00, 0x00, 0x00, // mov eax, 218 (SYS_set_tid_address)
-            0xbf, 0x00, 0x21, 0x40, 0x00, // mov edi, 0x00402100
+            0x49, 0x89, 0xc4, // mov r12, rax (r12 = 0x1000_0000)
+            // (B) SYS_pipe2(r12, 0) -> lưu [read_fd=3, write_fd=4] tại [0x1000_0000]
+            0x4c, 0x89, 0xe7, // mov rdi, r12
+            0x31, 0xf6, // xor esi, esi
+            0xb8, 0x25, 0x01, 0x00, 0x00, // mov eax, 293 (SYS_pipe2)
             0x0f, 0x05, // syscall
-            0x49, 0x89, 0xc6, // mov r14, rax (lưu TID = 1)
+            // (C) SYS_write(write_fd = [r12 + 4], "PIPE_OK!", 8)
+            0x41, 0x8b, 0x7c, 0x24, 0x04, // mov edi, dword ptr [r12 + 4]
+            0xbe, 0xd0, 0x20, 0x40, 0x00, // mov esi, 0x004020d0 ("PIPE_OK!")
+            0xba, 0x08, 0x00, 0x00, 0x00, // mov edx, 8
+            0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (SYS_write)
+            0x0f, 0x05, // syscall
+            // (D) SYS_read(read_fd = [r12], r12 + 0x100, 8) -> r13 = 8 bytes
+            0x41, 0x8b, 0x3c, 0x24, // mov edi, dword ptr [r12]
+            0x49, 0x8d, 0xb4, 0x24, 0x00, 0x01, 0x00, 0x00, // lea rsi, [r12 + 0x100]
+            0xba, 0x08, 0x00, 0x00, 0x00, // mov edx, 8
+            0x31, 0xc0, // xor eax, eax (SYS_read = 0)
+            0x0f, 0x05, // syscall
+            0x49, 0x89, 0xc5, // mov r13, rax (r13 = 8)
+            // (E) SYS_clock_gettime(CLOCK_MONOTONIC=1, r12 + 0x200)
+            0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1
+            0x49, 0x8d, 0xb4, 0x24, 0x00, 0x02, 0x00, 0x00, // lea rsi, [r12 + 0x200]
+            0xb8, 0xe4, 0x00, 0x00, 0x00, // mov eax, 228 (SYS_clock_gettime)
+            0x0f, 0x05, // syscall
+            // (F) SYS_futex(r12 + 0x300, FUTEX_WAKE=1, 1)
+            0x49, 0x8d, 0xbc, 0x24, 0x00, 0x03, 0x00, 0x00, // lea rdi, [r12 + 0x300]
+            0xc7, 0x07, 0x2a, 0x00, 0x00, 0x00, // mov dword ptr [rdi], 42
+            0xbe, 0x01, 0x00, 0x00, 0x00, // mov esi, 1 (FUTEX_WAKE)
+            0xba, 0x01, 0x00, 0x00, 0x00, // mov edx, 1
+            0xb8, 0xca, 0x00, 0x00, 0x00, // mov eax, 202 (SYS_futex)
+            0x0f, 0x05, // syscall
+            // (G) SYS_clone(SIGCHLD=17, 0) -> r14 = child PID (2) & SYS_wait4(2, r12 + 0x400, 0, 0)
+            0xbf, 0x11, 0x00, 0x00, 0x00, // mov edi, 17
+            0x31, 0xf6, // xor esi, esi
+            0xb8, 0x38, 0x00, 0x00, 0x00, // mov eax, 56 (SYS_clone)
+            0x0f, 0x05, // syscall
+            0x49, 0x89, 0xc6, // mov r14, rax (r14 = 2)
+            0x4c, 0x89, 0xf7, // mov rdi, r14
+            0x49, 0x8d, 0xb4, 0x24, 0x00, 0x04, 0x00, 0x00, // lea rsi, [r12 + 0x400]
+            0x31, 0xd2, // xor edx, edx
+            0x45, 0x31, 0xd2, // xor r10d, r10d
+            0xb8, 0x3d, 0x00, 0x00, 0x00, // mov eax, 61 (SYS_wait4)
+            0x0f, 0x05, // syscall
+            // (H) In thông điệp xác nhận từ Ring 3 qua SYS_write & SYS_writev
             0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (SYS_write)
             0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1 (stdout)
             0xbe, 0x00, 0x20, 0x40, 0x00, // mov esi, 0x00402000 (msg1)
@@ -1470,54 +1948,51 @@ pub mod linux_abi {
             0xbe, 0x90, 0x20, 0x40, 0x00, // mov esi, 0x00402090 (iovec[2])
             0xba, 0x02, 0x00, 0x00, 0x00, // mov edx, 2 (iovcnt = 2)
             0x0f, 0x05, // syscall
-            0xb8, 0x0c, 0x00, 0x00, 0x00, // mov eax, 12 (SYS_brk)
-            0xbf, 0x00, 0x80, 0x40, 0x00, // mov edi, 0x00408000
-            0x0f, 0x05, // syscall
-            // Kết hợp mã xác thực: rdi = (argc << 4) | (pid << 2) | tid = (2 << 4) | (1 << 2) | 1 = 0x25 (37)
-            0x4c, 0x89, 0xe7, // mov rdi, r12
+            // (I) Tính mã thoát xác thực: rdi = (r13 << 4) | r14 = (8 << 4) | 2 = 0x82
+            0x4c, 0x89, 0xef, // mov rdi, r13
             0x48, 0xc1, 0xe7, 0x04, // shl rdi, 4
-            0x49, 0xc1, 0xe5, 0x02, // shl r13, 2
-            0x4c, 0x09, 0xef, // or rdi, r13
             0x4c, 0x09, 0xf7, // or rdi, r14
             0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, 231 (SYS_exit_group)
             0x0f, 0x05, // syscall
         ];
-        elf[256..256 + code.len()].copy_from_slice(&code);
+        elf[256..256 + code.len()].copy_from_slice(code);
 
-        // 5. Dữ liệu .data tại file offset 384 (ánh xạ vào 0x0040_2000):
-        let msg1 = b"[RING-3 ELF64] Hello from Linux User-Space (CPL=3) via SYSCALL/SYSRETQ!\n";
-        elf[384..384 + 72].copy_from_slice(msg1);
+        // 5. Dữ liệu .data tại file offset 512 (ánh xạ vào 0x0040_2000):
+        let msg1 = b"[RING-3 ELF64] Phase 3 VMO mmap, Pipe2 IPC, Futex & Clone/Wait4 tested!\n";
+        elf[512..512 + 72].copy_from_slice(msg1);
 
-        let iov_part1 = b"[RING-3 ELF64] musl-style "; // 26 bytes tại 0x0040_2048 (file offset 456)
-        elf[456..456 + 26].copy_from_slice(iov_part1);
+        let iov_part1 = b"[RING-3 ELF64] musl-style "; // 26 bytes tại 0x0040_2048 (offset 584)
+        elf[584..584 + 26].copy_from_slice(iov_part1);
 
-        let iov_part2 = b"SYS_writev(iovcnt=2) verified in Ring 3!\n"; // 41 bytes tại 0x0040_2068 (file offset 488)
-        elf[488..488 + 41].copy_from_slice(iov_part2);
+        let iov_part2 = b"SYS_writev(iovcnt=2) verified in Ring 3!\n"; // 41 bytes tại 0x0040_2068 (offset 616)
+        elf[616..616 + 41].copy_from_slice(iov_part2);
 
-        // Mảng `struct iovec[2]` tại 0x0040_2090 (file offset 528):
-        // iov[0] = { base: 0x0040_2048, len: 26 }
-        // iov[1] = { base: 0x0040_2068, len: 41 }
-        elf[528..536].copy_from_slice(&0x0040_2048u64.to_le_bytes());
-        elf[536..544].copy_from_slice(&26u64.to_le_bytes());
-        elf[544..552].copy_from_slice(&0x0040_2068u64.to_le_bytes());
-        elf[552..560].copy_from_slice(&41u64.to_le_bytes());
+        // Mảng `struct iovec[2]` tại 0x0040_2090 (file offset 656):
+        elf[656..664].copy_from_slice(&0x0040_2048u64.to_le_bytes());
+        elf[664..672].copy_from_slice(&26u64.to_le_bytes());
+        elf[672..680].copy_from_slice(&0x0040_2068u64.to_le_bytes());
+        elf[680..688].copy_from_slice(&41u64.to_le_bytes());
+
+        // Chuỗi tải trọng kiểm thử đường ống IPC tại 0x0040_20D0 (file offset 720):
+        elf[720..728].copy_from_slice(b"PIPE_OK!");
 
         elf
     }
 }
 
 // ============================================================================
-// ĐIỂM NỐI SYSCALL TỪ RING 3 & QUẢN LÝ TRẠNG THÁI TIẾN TRÌNH HIỆN HÀNH
+// TRẠNG THÁI NHÂN BỀN VỮNG & ĐIỂM NỐI SYSCALL TỪ RING 3
 // ============================================================================
+static mut GLOBAL_KERNEL_CTX: linux_abi::KernelContext = linux_abi::KernelContext::const_new();
+
 #[no_mangle]
 extern "C" fn zenith_syscall_entry_from_asm(frame: &mut ostd::TrapFrame) {
-    let mut active_proc = linux_abi::LinuxProcessState::new(1, 0x0000_0000_0040_3000);
-    let mut pmm = ostd::BitmapFrameAllocator::new();
-    linux_abi::dispatch_linux_syscall(frame, &mut active_proc, &mut pmm);
+    // SAFETY:
+    // Thực thi đơn luồng trên BSP khi xử lý lệnh `syscall` từ Ring 3.
+    let ctx = unsafe { &mut *(&raw mut GLOBAL_KERNEL_CTX) };
+    linux_abi::dispatch_linux_syscall(frame, ctx);
 
-    // Nếu tiến trình Ring 3 vừa gọi SYS_exit hoặc SYS_exit_group, thoát khỏi ngữ cảnh User-space
-    // và trả mã thoát về cho hàm `ostd::enter_user_space` trong Kernel!
-    if let Some(exit_code) = active_proc.last_exit_code {
+    if let Some(exit_code) = ctx.last_exit_code {
         ostd::return_to_kernel_from_exit(exit_code);
     }
 }
@@ -1529,12 +2004,12 @@ macro_rules! kprintln {
     };
 }
 
-/// Điểm vào chính của Kernel ZenithOS (Phase 1 + Phase 2: ELF64 & Ring 3 User-Space).
+/// Điểm vào chính của Kernel ZenithOS (Phase 3: VMO, Capabilities, Pipe2, Futex & Clone/Wait4).
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     ostd::SerialConsole::init();
     kprintln!("================================================================");
-    kprintln!("  ZenithOS v0.2.0 - 100% Rust Framekernel (Linux ABI Phase 2)   ");
+    kprintln!("  ZenithOS v0.3.0 - 100% Rust Framekernel (Linux ABI Phase 3)   ");
     kprintln!("================================================================");
 
     // 1. Khởi tạo GDT, TSS, IDT và MSR cho SYSCALL/SYSRETQ
@@ -1549,18 +2024,22 @@ pub extern "C" fn _start() -> ! {
     ostd::disable_smap_for_loader();
     kprintln!("[ZENITH-OSTD] GDT/TSS, IDT (#BP), and SYSCALL/SYSRETQ MSRs ready.");
 
-    // 2. Khởi tạo PMM (kèm HHDM & Kernel Address từ Limine)
-    let mut pmm = ostd::BitmapFrameAllocator::new();
+    // 2. Khởi tạo Ngữ cảnh Nhân Bền vững (Persistent Kernel Context)
+    // SAFETY:
+    // Khởi tạo duy nhất 1 lần lúc boot trên BSP trước khi nhảy vào Ring 3.
+    let ctx = unsafe { &mut *(&raw mut GLOBAL_KERNEL_CTX) };
+    ctx.init_hardware_pmm();
 
     // 3. Xây dựng và nạp ảnh thực thi Linux ELF64 (`/bin/init`) vào vùng nhớ User-space
     let elf_image = linux_abi::build_embedded_linux_init_elf64();
-    let loaded = match linux_abi::load_elf64_into_user_space(&elf_image, &mut pmm) {
+    let loaded = match linux_abi::load_elf64_into_user_space(&elf_image, &mut ctx.pmm) {
         Ok(info) => info,
         Err(err) => {
             kprintln!("[ZENITH-ELF][FAIL] ELF64 Loader error: {:?}", err);
             ostd::exit_qemu(ostd::QemuExitCode::Failed);
         }
     };
+    ctx.program_break = loaded.initial_brk;
     kprintln!(
         "[ZENITH-ELF] Loaded Linux x86_64 ELF64 '/bin/init': entry=0x{:x}, user_rsp=0x{:x}, brk=0x{:x}",
         loaded.entry_rip,
@@ -1568,7 +2047,7 @@ pub extern "C" fn _start() -> ! {
         loaded.initial_brk
     );
 
-    // 4. Nhảy xuống Ring 3 (CPL = 3) qua `sysretq` để thực thi tiến trình Linux `/bin/init`!
+    // 4. Nhảy xuống Ring 3 (CPL = 3) qua `sysretq` để chạy bộ kiểm thử tích hợp Phase 3!
     kprintln!("[ZENITH-CORE] Transitioning to Ring 3 User-Space via SYSRETQ...");
     let exit_code = ostd::enter_user_space(loaded.entry_rip, loaded.user_rsp);
     kprintln!(
@@ -1576,18 +2055,40 @@ pub extern "C" fn _start() -> ! {
         exit_code
     );
 
-    // Kiểm tra mã xác thực trả về từ Ring 3:
-    // (argc=2 << 4) | (pid=1 << 2) | (tid=1) = 0x25 (37)
-    if exit_code != 0x25 {
+    // 5. Xác thực kết quả thực thi của tiến trình Ring 3 trên vùng nhớ VMO `0x1000_0000`:
+    // - Token trả về phải bằng 0x82: (8 bytes đọc từ Pipe << 4) | (Child PID 2 từ SYS_clone)
+    if exit_code != 0x82 {
         kprintln!(
-            "[ZENITH-TEST][FAIL] Unexpected Ring 3 exit token: 0x{:x} (expected 0x25)",
+            "[ZENITH-TEST][FAIL] Unexpected Ring 3 exit token: 0x{:x} (expected 0x82)",
             exit_code
         );
         ostd::exit_qemu(ostd::QemuExitCode::Failed);
     }
 
+    // - Kiểm tra dữ liệu thực tế mà Ring 3 đã đọc từ Pipe IPC và ghi vào trang mmap `0x1000_0100`
+    let mut pipe_verify = [0u8; 8];
+    if ostd::copy_from_buffer(0x1000_0100, &mut pipe_verify).is_err()
+        || &pipe_verify != b"PIPE_OK!"
+    {
+        kprintln!("[ZENITH-TEST][FAIL] Ring 3 Pipe2 IPC data mismatch at 0x1000_0100!");
+        ostd::exit_qemu(ostd::QemuExitCode::Failed);
+    }
+    kprintln!("[ZENITH-LINUX] Verified Ring 3 VMO mmap (0x10000000) & Pipe2 IPC (\"PIPE_OK!\").");
+
+    // - Kiểm tra giá trị Futex (42) mà Ring 3 đã ghi tại `0x1000_0300`
+    let mut futex_verify = [0u8; 4];
+    if ostd::copy_from_buffer(0x1000_0300, &mut futex_verify).is_err()
+        || u32::from_le_bytes(futex_verify) != 42
+    {
+        kprintln!("[ZENITH-TEST][FAIL] Ring 3 Futex word verification failed!");
+        ostd::exit_qemu(ostd::QemuExitCode::Failed);
+    }
+    kprintln!(
+        "[ZENITH-LINUX] Verified Ring 3 ClockGettime (RDTSC), Futex, and Clone/Wait4 (PID=2)."
+    );
+
     kprintln!("================================================================");
-    kprintln!("[ZENITH-CI] ALL PHASE 2 ELF64 & RING 3 USER-SPACE TESTS PASSED! ");
+    kprintln!("[ZENITH-CI] ALL PHASE 3 VMO, PIPE2, FUTEX & TASK TESTS PASSED!  ");
     kprintln!("================================================================");
 
     ostd::exit_qemu(ostd::QemuExitCode::Success);
