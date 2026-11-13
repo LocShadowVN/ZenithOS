@@ -1,9 +1,9 @@
 [package]
 name = "zenith-os"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["ZenithOS Contributors"]
-description = "ZenithOS - 100% Rust Framekernel with Linux ABI Compatibility"
+description = "ZenithOS - 100% Rust Framekernel Operating System with Linux & Windows ABI Compatibility"
 license = "GPL-3.0-only"
 
 [[bin]]
