@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["ZenithOS Contributors"]
 description = "ZenithOS - 100% Rust Framekernel with Linux ABI Compatibility"
-license = "GPL-3.0"
+license = "GPL-3.0-only"
 
 [[bin]]
 name = "zenith-kernel"
