@@ -59,8 +59,8 @@ pub mod boot_protocol {
 
     #[used]
     #[link_section = ".data"]
-    pub static LIMINE_REQUESTS: BootRequestsCell = BootRequestsCell(UnsafeCell::new(
-        LimineBootRequests {
+    pub static LIMINE_REQUESTS: BootRequestsCell =
+        BootRequestsCell(UnsafeCell::new(LimineBootRequests {
             start_marker: [
                 0xf6b8_f4b3_9de7_d1ae,
                 0xfab9_1a69_40fc_b9cf,
@@ -89,8 +89,7 @@ pub mod boot_protocol {
                 response: core::ptr::null(),
             },
             end_marker: [0xadc0_e053_1bb1_0d03, 0x9572_709f_3176_4c62],
-        },
-    ));
+        }));
 }
 
 // ============================================================================
