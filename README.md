@@ -86,7 +86,7 @@
   - 100% Safe Rust Linux `ELF64` parser and segment loader (`PT_LOAD`).
   - System V AMD64 ABI initial user stack construction (`argc`, `argv`, `envp`, and Auxiliary Vectors `AT_PAGESZ`, `AT_ENTRY`, `AT_PHENT`, `AT_PHNUM`).
   - Bidirectional Ring 0 $\leftrightarrow$ Ring 3 transitions via `sysretq` and `syscall` (`swapgs`), executing embedded Linux `/bin/init` in `CPL = 3` with `SYS_read`, `SYS_write`, `SYS_writev`, `SYS_ioctl`, `SYS_mmap`, `SYS_brk`, `SYS_uname`, `SYS_getpid`, `SYS_gettid`, `SYS_set_tid_address`, `SYS_arch_prctl`, and `SYS_exit_group`.
-- [ ] **Phase 3: Preemptive SMP Scheduler, VMO & Capability Engine**
+- [x] **Phase 3: Preemptive SMP Scheduler, VMO & Capability Engine**
   - Per-CPU runqueues, APIC Timer preemption, Copy-on-Write (`fork` / `clone`), and `futex` / `WaitPort` synchronization.
 - [ ] **Phase 4: VFS, Initramfs (CPIO/Tar) & Interactive Linux Userland (`busybox` / `musl`)**
   - In-memory VFS, VirtIO Block/Network drivers, dynamic linker (`ld-musl-x86_64.so.1`) support, and interactive shell.
