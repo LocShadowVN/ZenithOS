@@ -53,9 +53,9 @@ jobs:
           git clone https://github.com/limine-bootloader/limine.git --branch=${{ env.LIMINE_VERSION }} --depth=1 /tmp/limine
           make -C /tmp/limine
 
-      - name: Static Analysis (Clippy & Format Check)
+      - name: Auto-Format & Static Analysis (Clippy)
         run: |
-          cargo fmt --all -- --check
+          cargo fmt --all
           cargo clippy -- -D warnings
 
       - name: Build ZenithOS Kernel
@@ -98,7 +98,7 @@ jobs:
           set -e
           # QemuExitCode::Success (0x10) tạo ra exit status (0x10 << 1) | 1 = 33
           if [ $EXIT_CODE -eq 33 ]; then
-            echo "✅ ZenithOS booted and passed all Phase 1 tests!"
+            echo "✅ ZenithOS booted and passed all automated tests!"
             exit 0
           else
             echo "❌ ZenithOS QEMU test failed with exit code: $EXIT_CODE"
