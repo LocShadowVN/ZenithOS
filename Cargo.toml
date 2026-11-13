@@ -1,6 +1,6 @@
 [package]
 name = "zenith-os"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 authors = ["ZenithOS Contributors"]
 description = "ZenithOS - 100% Rust Framekernel Operating System with Linux & Windows ABI Compatibility"
