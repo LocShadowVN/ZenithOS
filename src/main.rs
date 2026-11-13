@@ -3,6 +3,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::fn_to_numeric_cast)]
 
+use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
 use core::sync::atomic::Ordering;
 
@@ -1066,6 +1067,12 @@ pub mod linux_abi {
         pub count: usize,
     }
 
+    impl Default for PipeRingBuffer {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl PipeRingBuffer {
         pub const fn new() -> Self {
             Self {
@@ -1531,7 +1538,8 @@ pub mod linux_abi {
         if length == 0 {
             return Err(LinuxErrno::Einval);
         }
-        let num_pages = length.wrapping_add(0xFFF) / (PAGE_SIZE as u64);
+        let page_sz = PAGE_SIZE as u64;
+        let num_pages = length.wrapping_add(0xFFF) / page_sz;
         let base_va = if addr_hint != 0 && (addr_hint & 0xFFF) == 0 {
             addr_hint
         } else {
@@ -1539,12 +1547,12 @@ pub mod linux_abi {
         };
 
         for i in 0..num_pages {
-            let page_va = base_va + i * (PAGE_SIZE as u64);
+            let page_va = base_va + i * page_sz;
             map_user_page(&mut ctx.pmm, page_va).map_err(|_| LinuxErrno::Enomem)?;
         }
 
         if base_va >= ctx.next_mmap_va {
-            ctx.next_mmap_va = base_va + num_pages * (PAGE_SIZE as u64);
+            ctx.next_mmap_va = base_va + num_pages * page_sz;
         }
         Ok(base_va)
     }
@@ -1579,8 +1587,6 @@ pub mod linux_abi {
     }
 
     fn sys_clock_gettime(_clock_id: u64, tp_user_ptr: u64) -> Result<u64, LinuxErrno> {
-        // Đọc chu kỳ TSC phần cứng và quy đổi ra struct timespec { tv_sec: i64, tv_nsec: i64 }
-        // (Giả định tần số cơ sở ~2.0 GHz -> 1 cycle = 0.5 ns)
         let cycles = read_tsc();
         let total_ns = cycles / 2;
         let tv_sec = (total_ns / 1_000_000_000) as i64;
@@ -1837,13 +1843,6 @@ pub mod linux_abi {
         Ok(rsp)
     }
 
-    /// Đóng gói ảnh thực thi Linux `x86_64` ELF64 (`/bin/init` - Phase 3) chạy ở Ring 3 (`CPL = 3`):
-    /// 1. Gọi `SYS_mmap` cấp phát trang VMO ẩn danh tại `0x1000_0000` và đọc/ghi trực tiếp ở Ring 3.
-    /// 2. Gọi `SYS_pipe2` tạo đường ống IPC, `SYS_write` ghi `"PIPE_OK!"` vào đầu ghi, `SYS_read` đọc ra đầu đọc.
-    /// 3. Gọi `SYS_clock_gettime(CLOCK_MONOTONIC)` đọc thời gian phần cứng TSC.
-    /// 4. Gọi `SYS_futex(FUTEX_WAKE)` kiểm tra đồng bộ hóa.
-    /// 5. Gọi `SYS_clone` tạo tiến trình con (PID 2) và `SYS_wait4` thu hồi trạng thái.
-    /// 6. Gọi `SYS_write` & `SYS_writev` in kết quả ra console và thoát với mã xác thực `0x82`.
     pub fn build_embedded_linux_init_elf64() -> [u8; 1024] {
         let mut elf = [0u8; 1024];
 
@@ -1883,7 +1882,7 @@ pub mod linux_abi {
         elf[ph1 + 40..ph1 + 48].copy_from_slice(&384u64.to_le_bytes()); // p_memsz
         elf[ph1 + 48..ph1 + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
 
-        // 4. Mã máy Ring 3 x86_64 (dùng kiểu lát cắt `&[u8]` để tự động suy diễn độ dài!):
+        // 4. Mã máy Ring 3 x86_64:
         let code: &[u8] = &[
             // (A) SYS_mmap(NULL, 4096, PROT_RW, MAP_PRIVATE|MAP_ANON, -1, 0) -> rax = 0x1000_0000
             0xb8, 0x09, 0x00, 0x00, 0x00, // mov eax, 9 (SYS_mmap)
@@ -1983,13 +1982,25 @@ pub mod linux_abi {
 // ============================================================================
 // TRẠNG THÁI NHÂN BỀN VỮNG & ĐIỂM NỐI SYSCALL TỪ RING 3
 // ============================================================================
-static mut GLOBAL_KERNEL_CTX: linux_abi::KernelContext = linux_abi::KernelContext::const_new();
+struct SyncContextCell(UnsafeCell<linux_abi::KernelContext>);
+
+// SAFETY:
+// Truy cập tuần tự trên BSP trong quá trình thực thi Syscall.
+unsafe impl Sync for SyncContextCell {}
+
+impl SyncContextCell {
+    const fn new() -> Self {
+        Self(UnsafeCell::new(linux_abi::KernelContext::const_new()))
+    }
+}
+
+static GLOBAL_KERNEL_CTX: SyncContextCell = SyncContextCell::new();
 
 #[no_mangle]
 extern "C" fn zenith_syscall_entry_from_asm(frame: &mut ostd::TrapFrame) {
     // SAFETY:
     // Thực thi đơn luồng trên BSP khi xử lý lệnh `syscall` từ Ring 3.
-    let ctx = unsafe { &mut *(&raw mut GLOBAL_KERNEL_CTX) };
+    let ctx = unsafe { &mut *GLOBAL_KERNEL_CTX.0.get() };
     linux_abi::dispatch_linux_syscall(frame, ctx);
 
     if let Some(exit_code) = ctx.last_exit_code {
@@ -2027,7 +2038,7 @@ pub extern "C" fn _start() -> ! {
     // 2. Khởi tạo Ngữ cảnh Nhân Bền vững (Persistent Kernel Context)
     // SAFETY:
     // Khởi tạo duy nhất 1 lần lúc boot trên BSP trước khi nhảy vào Ring 3.
-    let ctx = unsafe { &mut *(&raw mut GLOBAL_KERNEL_CTX) };
+    let ctx = unsafe { &mut *GLOBAL_KERNEL_CTX.0.get() };
     ctx.init_hardware_pmm();
 
     // 3. Xây dựng và nạp ảnh thực thi Linux ELF64 (`/bin/init`) vào vùng nhớ User-space
@@ -2067,8 +2078,7 @@ pub extern "C" fn _start() -> ! {
 
     // - Kiểm tra dữ liệu thực tế mà Ring 3 đã đọc từ Pipe IPC và ghi vào trang mmap `0x1000_0100`
     let mut pipe_verify = [0u8; 8];
-    if ostd::copy_from_buffer(0x1000_0100, &mut pipe_verify).is_err()
-        || &pipe_verify != b"PIPE_OK!"
+    if ostd::copy_from_buffer(0x1000_0100, &mut pipe_verify).is_err() || &pipe_verify != b"PIPE_OK!"
     {
         kprintln!("[ZENITH-TEST][FAIL] Ring 3 Pipe2 IPC data mismatch at 0x1000_0100!");
         ostd::exit_qemu(ostd::QemuExitCode::Failed);
