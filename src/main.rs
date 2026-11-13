@@ -9,15 +9,10 @@ use core::sync::atomic::Ordering;
 
 // ============================================================================
 // GIAO THỨC KHỞI ĐỘNG LIMINE (HHDM & KERNEL PHYSICAL ADDRESS)
+// Gom vào một khối #[repr(C)] bọc UnsafeCell trong .data để chống LLVM constant-folding.
 // ============================================================================
 pub mod boot_protocol {
-    #[repr(C)]
-    pub struct LimineBaseRevision {
-        pub id: [u64; 2],
-        pub revision: u64,
-    }
-
-    unsafe impl Sync for LimineBaseRevision {}
+    use core::cell::UnsafeCell;
 
     #[repr(C)]
     pub struct LimineHhdmResponse {
@@ -31,8 +26,6 @@ pub mod boot_protocol {
         pub revision: u64,
         pub response: *const LimineHhdmResponse,
     }
-
-    unsafe impl Sync for LimineHhdmRequest {}
 
     #[repr(C)]
     pub struct LimineKernelAddressResponse {
@@ -48,53 +41,56 @@ pub mod boot_protocol {
         pub response: *const LimineKernelAddressResponse,
     }
 
-    unsafe impl Sync for LimineKernelAddressRequest {}
+    #[repr(C)]
+    pub struct LimineBootRequests {
+        pub start_marker: [u64; 4],
+        pub base_revision: [u64; 3],
+        pub hhdm: LimineHhdmRequest,
+        pub kernel_addr: LimineKernelAddressRequest,
+        pub end_marker: [u64; 2],
+    }
+
+    #[repr(transparent)]
+    pub struct BootRequestsCell(pub UnsafeCell<LimineBootRequests>);
+
+    // SAFETY:
+    // Chỉ được ghi bởi Bootloader Limine trước khi vào `_start` và chỉ đọc trên BSP.
+    unsafe impl Sync for BootRequestsCell {}
 
     #[used]
-    #[link_section = ".requests"]
-    pub static BASE_REVISION: LimineBaseRevision = LimineBaseRevision {
-        id: [0xf956_2b2d_5c95_a6c8, 0x6a7b_3849_4453_6bdc],
-        revision: 2,
-    };
-
-    #[used]
-    #[link_section = ".requests"]
-    pub static HHDM_REQUEST: LimineHhdmRequest = LimineHhdmRequest {
-        id: [
-            0xc7b1_dd30_df4c_8b88,
-            0x0a82_e883_a194_f07b,
-            0x48dc_f1cb_8ad2_b852,
-            0x6398_4e95_9a98_244b,
-        ],
-        revision: 0,
-        response: core::ptr::null(),
-    };
-
-    #[used]
-    #[link_section = ".requests"]
-    pub static KERNEL_ADDRESS_REQUEST: LimineKernelAddressRequest = LimineKernelAddressRequest {
-        id: [
-            0xc7b1_dd30_df4c_8b88,
-            0x0a82_e883_a194_f07b,
-            0x71ba_7686_3cc5_5f63,
-            0xb264_4a48_c516_a487,
-        ],
-        revision: 0,
-        response: core::ptr::null(),
-    };
-
-    #[used]
-    #[link_section = ".requests_start_marker"]
-    pub static REQUESTS_START_MARKER: [u64; 4] = [
-        0xf6b8_f4b3_9de7_d1ae,
-        0xfab9_1a69_40fc_b9cf,
-        0x785c_6ed0_15d3_e316,
-        0x181e_920a_7852_b9d9,
-    ];
-
-    #[used]
-    #[link_section = ".requests_end_marker"]
-    pub static REQUESTS_END_MARKER: [u64; 2] = [0xadc0_e053_1bb1_0d03, 0x9572_709f_3176_4c62];
+    #[link_section = ".data"]
+    pub static LIMINE_REQUESTS: BootRequestsCell = BootRequestsCell(UnsafeCell::new(
+        LimineBootRequests {
+            start_marker: [
+                0xf6b8_f4b3_9de7_d1ae,
+                0xfab9_1a69_40fc_b9cf,
+                0x785c_6ed0_15d3_e316,
+                0x181e_920a_7852_b9d9,
+            ],
+            base_revision: [0xf956_2b2d_5c95_a6c8, 0x6a7b_3849_4453_6bdc, 2],
+            hhdm: LimineHhdmRequest {
+                id: [
+                    0xc7b1_dd30_df4c_8b88,
+                    0x0a82_e883_a194_f07b,
+                    0x48dc_f1cb_8ad2_b852,
+                    0x6398_4e95_9a98_244b,
+                ],
+                revision: 0,
+                response: core::ptr::null(),
+            },
+            kernel_addr: LimineKernelAddressRequest {
+                id: [
+                    0xc7b1_dd30_df4c_8b88,
+                    0x0a82_e883_a194_f07b,
+                    0x71ba_7686_3cc5_5f63,
+                    0xb264_4a48_c516_a487,
+                ],
+                revision: 0,
+                response: core::ptr::null(),
+            },
+            end_marker: [0xadc0_e053_1bb1_0d03, 0x9572_709f_3176_4c62],
+        },
+    ));
 }
 
 // ============================================================================
@@ -522,9 +518,9 @@ pub mod ostd {
     pub struct BitmapFrameAllocator {
         bitmap: [u64; 4],
         base_addr: u64,
-        hhdm_offset: u64,
-        kernel_phys_base: u64,
-        kernel_virt_base: u64,
+        pub hhdm_offset: u64,
+        pub kernel_phys_base: u64,
+        pub kernel_virt_base: u64,
     }
 
     impl Default for BitmapFrameAllocator {
@@ -547,20 +543,22 @@ pub mod ostd {
         pub fn new() -> Self {
             let base_addr = &raw const STATIC_FRAME_POOL as u64;
             let mut hhdm_offset = 0xFFFF_8000_0000_0000;
-            let mut kernel_phys_base = 0;
+            let mut kernel_phys_base = 0x0020_0000;
             let mut kernel_virt_base = 0xFFFF_FFFF_8000_0000;
 
             // SAFETY:
-            // Đọc thông tin HHDM và Kernel Address do Limine điền trước khi nhảy vào `_start`.
+            // Sử dụng `read_volatile` trên vùng `UnsafeCell` để ngăn trình biên dịch LLVM
+            // tối ưu hóa hằng số (constant-fold) các con trỏ phản hồi của Limine thành `null`.
             unsafe {
-                let hhdm_resp = crate::boot_protocol::HHDM_REQUEST.response;
+                let req_ptr = crate::boot_protocol::LIMINE_REQUESTS.0.get();
+                let hhdm_resp = core::ptr::read_volatile(&(*req_ptr).hhdm.response);
                 if !hhdm_resp.is_null() {
-                    hhdm_offset = (*hhdm_resp).offset;
+                    hhdm_offset = core::ptr::read_volatile(&(*hhdm_resp).offset);
                 }
-                let ka_resp = crate::boot_protocol::KERNEL_ADDRESS_REQUEST.response;
+                let ka_resp = core::ptr::read_volatile(&(*req_ptr).kernel_addr.response);
                 if !ka_resp.is_null() {
-                    kernel_phys_base = (*ka_resp).physical_base;
-                    kernel_virt_base = (*ka_resp).virtual_base;
+                    kernel_phys_base = core::ptr::read_volatile(&(*ka_resp).physical_base);
+                    kernel_virt_base = core::ptr::read_volatile(&(*ka_resp).virtual_base);
                 }
             }
 
@@ -612,12 +610,14 @@ pub mod ostd {
 
         #[inline]
         pub const fn kernel_virt_to_phys(&self, virt_addr: u64) -> u64 {
-            (virt_addr - self.kernel_virt_base) + self.kernel_phys_base
+            virt_addr
+                .wrapping_sub(self.kernel_virt_base)
+                .wrapping_add(self.kernel_phys_base)
         }
 
         #[inline]
         pub const fn phys_to_hhdm_virt(&self, phys_addr: u64) -> u64 {
-            phys_addr + self.hhdm_offset
+            phys_addr.wrapping_add(self.hhdm_offset)
         }
     }
 
@@ -628,6 +628,7 @@ pub mod ostd {
         pub const PRESENT: u64 = 1 << 0;
         pub const WRITABLE: u64 = 1 << 1;
         pub const USER: u64 = 1 << 2;
+        pub const HUGE_PAGE: u64 = 1 << 7;
         pub const USER_RWX: u64 = Self::PRESENT | Self::WRITABLE | Self::USER;
     }
 
@@ -714,16 +715,16 @@ pub mod ostd {
         // `table_virt` là địa chỉ ảo HHDM của bảng trang hiện tại, `idx` nằm trong khoảng `0..512`.
         unsafe {
             let entry = (*table_virt).entries[idx];
-            if (entry & PageFlags::PRESENT) != 0 {
-                let updated = (entry | PageFlags::USER_RWX) & !(1u64 << 63);
-                (*table_virt).entries[idx] = updated;
-                Ok(updated & 0x000F_FFFF_FFFF_F000)
+            if (entry & PageFlags::PRESENT) != 0 && (entry & PageFlags::HUGE_PAGE) == 0 {
+                let phys = entry & 0x000F_FFFF_FFFF_F000;
+                (*table_virt).entries[idx] = phys | PageFlags::USER_RWX;
+                Ok(phys)
             } else {
                 let new_table_kvirt = pmm.allocate_frame()?;
                 let new_table_phys = pmm.kernel_virt_to_phys(new_table_kvirt);
-                (*table_virt).entries[idx] =
-                    (new_table_phys & 0x000F_FFFF_FFFF_F000) | PageFlags::USER_RWX;
-                Ok(new_table_phys)
+                let clean_phys = new_table_phys & 0x000F_FFFF_FFFF_F000;
+                (*table_virt).entries[idx] = clean_phys | PageFlags::USER_RWX;
+                Ok(clean_phys)
             }
         }
     }
@@ -2040,6 +2041,12 @@ pub extern "C" fn _start() -> ! {
     // Khởi tạo duy nhất 1 lần lúc boot trên BSP trước khi nhảy vào Ring 3.
     let ctx = unsafe { &mut *GLOBAL_KERNEL_CTX.0.get() };
     ctx.init_hardware_pmm();
+    kprintln!(
+        "[ZENITH-OSTD] Limine HHDM=0x{:x}, KernelPhys=0x{:x}, KernelVirt=0x{:x}",
+        ctx.pmm.hhdm_offset,
+        ctx.pmm.kernel_phys_base,
+        ctx.pmm.kernel_virt_base
+    );
 
     // 3. Xây dựng và nạp ảnh thực thi Linux ELF64 (`/bin/init`) vào vùng nhớ User-space
     let elf_image = linux_abi::build_embedded_linux_init_elf64();
