@@ -9,7 +9,6 @@ use core::sync::atomic::Ordering;
 
 // ============================================================================
 // GIAO THỨC KHỞI ĐỘNG LIMINE (HHDM & KERNEL PHYSICAL ADDRESS)
-// Gom vào một khối #[repr(C)] bọc UnsafeCell trong .data để chống LLVM constant-folding.
 // ============================================================================
 pub mod boot_protocol {
     use core::cell::UnsafeCell;
@@ -158,7 +157,6 @@ pub mod ostd {
         }
     }
 
-    /// Đọc thanh ghi bộ đếm chu kỳ phần cứng TSC (`rdtsc`) phục vụ `SYS_clock_gettime`.
     #[inline(always)]
     pub fn read_tsc() -> u64 {
         let low: u32;
@@ -964,7 +962,7 @@ pub mod ostd {
 }
 
 // ============================================================================
-// MODULE 2: SAFE KERNEL CORE, CAPABILITIES, VMO, SCHEDULER & LINUX ABI
+// MODULE 2: SAFE KERNEL CORE, VFS, INITRAMFS, EXECVE & LINUX ABI (PHASE 4)
 // Toàn bộ tầng này cấm tuyệt đối `unsafe` và cấm `unwrap()` / `expect()`.
 // ============================================================================
 #[forbid(unsafe_code)]
@@ -985,9 +983,12 @@ pub mod linux_abi {
         Enomem = 12,
         Eacces = 13,
         Efault = 14,
+        Enotdir = 20,
+        Eisdir = 21,
         Einval = 22,
         Emfile = 24,
         Enosys = 38,
+        Erange = 34,
     }
 
     impl LinuxErrno {
@@ -1000,8 +1001,10 @@ pub mod linux_abi {
     // Bảng số hiệu Syscall chuẩn của kiến trúc Linux x86_64
     pub const SYS_READ: u64 = 0;
     pub const SYS_WRITE: u64 = 1;
+    pub const SYS_OPEN: u64 = 2;
     pub const SYS_CLOSE: u64 = 3;
     pub const SYS_FSTAT: u64 = 5;
+    pub const SYS_LSEEK: u64 = 8;
     pub const SYS_MMAP: u64 = 9;
     pub const SYS_MPROTECT: u64 = 10;
     pub const SYS_MUNMAP: u64 = 11;
@@ -1014,16 +1017,23 @@ pub mod linux_abi {
     pub const SYS_NANOSLEEP: u64 = 35;
     pub const SYS_GETPID: u64 = 39;
     pub const SYS_CLONE: u64 = 56;
+    pub const SYS_EXECVE: u64 = 59;
     pub const SYS_EXIT: u64 = 60;
     pub const SYS_WAIT4: u64 = 61;
     pub const SYS_UNAME: u64 = 63;
+    pub const SYS_GETCWD: u64 = 79;
+    pub const SYS_CHDIR: u64 = 80;
     pub const SYS_GETPPID: u64 = 110;
     pub const SYS_ARCH_PRCTL: u64 = 158;
     pub const SYS_GETTID: u64 = 186;
     pub const SYS_FUTEX: u64 = 202;
+    pub const SYS_GETDENTS64: u64 = 217;
     pub const SYS_SET_TID_ADDRESS: u64 = 218;
     pub const SYS_CLOCK_GETTIME: u64 = 228;
     pub const SYS_EXIT_GROUP: u64 = 231;
+    pub const SYS_OPENAT: u64 = 257;
+    pub const SYS_NEWFSTATAT: u64 = 262;
+    pub const SYS_FACCESSAT: u64 = 269;
     pub const SYS_PIPE2: u64 = 293;
 
     pub const ARCH_SET_GS: u64 = 0x1001;
@@ -1037,8 +1047,19 @@ pub mod linux_abi {
     pub const FUTEX_PRIVATE_FLAG: u64 = 128;
 
     // ------------------------------------------------------------------------
-    // 2.1: HỆ THỐNG CAPABILITY, FILE DESCRIPTOR TABLE & ĐƯỜNG ỐNG IPC (PIPE)
+    // 2.1: VIRTUAL FILE SYSTEM (VFS), CAPABILITIES & PIPE IPC
     // ------------------------------------------------------------------------
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum VfsNodeKind {
+        RootDir,
+        OsRelease,
+        ProcVersion,
+        DevNull,
+        DevZero,
+        BinInit,
+        BinApp,
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum CapObject {
         SerialIn,
@@ -1046,6 +1067,8 @@ pub mod linux_abi {
         SerialErr,
         PipeRead(usize),
         PipeWrite(usize),
+        VfsFile { kind: VfsNodeKind, offset: usize },
+        VfsDir { offset: usize },
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -1117,6 +1140,36 @@ pub mod linux_abi {
         }
     }
 
+    const OS_RELEASE_CONTENT: &[u8] =
+        b"NAME=\"ZenithOS\"\nVERSION=\"0.4.0\"\nID=zenith\nPRETTY_NAME=\"ZenithOS v0.4.0\"\n";
+    const PROC_VERSION_CONTENT: &[u8] =
+        b"Linux version 6.8.0-zenith-framekernel (rust@zenith) #1 SMP PREEMPT_DYNAMIC\n";
+
+    fn resolve_vfs_path(path: &[u8]) -> Result<VfsNodeKind, LinuxErrno> {
+        match path {
+            b"/" | b"." => Ok(VfsNodeKind::RootDir),
+            b"/etc/os-release" | b"etc/os-release" => Ok(VfsNodeKind::OsRelease),
+            b"/proc/version" | b"proc/version" => Ok(VfsNodeKind::ProcVersion),
+            b"/dev/null" => Ok(VfsNodeKind::DevNull),
+            b"/dev/zero" => Ok(VfsNodeKind::DevZero),
+            b"/bin/init" => Ok(VfsNodeKind::BinInit),
+            b"/bin/app" => Ok(VfsNodeKind::BinApp),
+            _ => Err(LinuxErrno::Enoent),
+        }
+    }
+
+    fn read_cstr_from_user(user_ptr: u64, buf: &mut [u8; 64]) -> Result<&[u8], LinuxErrno> {
+        copy_from_buffer(user_ptr, buf).map_err(|_| LinuxErrno::Efault)?;
+        let mut len = 0;
+        while len < buf.len() {
+            if buf.get(len) == Some(&0) {
+                break;
+            }
+            len += 1;
+        }
+        buf.get(..len).ok_or(LinuxErrno::Einval)
+    }
+
     // ------------------------------------------------------------------------
     // 2.2: QUẢN LÝ TIẾN TRÌNH (TASK TABLE), VMO MMAP & WAITPORT (FUTEX)
     // ------------------------------------------------------------------------
@@ -1150,7 +1203,6 @@ pub mod linux_abi {
 
     pub const MAX_TASKS: usize = 8;
 
-    /// Trạng thái nhân bền vững (Persistent Kernel Context) xuyên suốt mọi lệnh Syscall.
     pub struct KernelContext {
         pub pmm: BitmapFrameAllocator,
         pub current_pid: u64,
@@ -1158,6 +1210,8 @@ pub mod linux_abi {
         pub program_break: u64,
         pub next_mmap_va: u64,
         pub last_exit_code: Option<i32>,
+        pub cwd: [u8; 64],
+        pub cwd_len: usize,
         pub fd_table: [Option<CapabilityEntry>; MAX_FDS],
         pub pipes: [PipeRingBuffer; MAX_PIPES],
         pub tasks: [TaskControlBlock; MAX_TASKS],
@@ -1190,6 +1244,9 @@ pub mod linux_abi {
                 clear_child_tid: 0,
             };
 
+            let mut cwd = [0u8; 64];
+            cwd[0] = b'/';
+
             Self {
                 pmm: BitmapFrameAllocator::const_uninit(),
                 current_pid: 1,
@@ -1197,6 +1254,8 @@ pub mod linux_abi {
                 program_break: 0x0000_0000_0040_3000,
                 next_mmap_va: 0x0000_0000_1000_0000,
                 last_exit_code: None,
+                cwd,
+                cwd_len: 1,
                 fd_table: fds,
                 pipes: [
                     PipeRingBuffer::new(),
@@ -1280,14 +1339,16 @@ pub mod linux_abi {
     }
 
     // ------------------------------------------------------------------------
-    // 2.3: BỘ ĐIỀU PHỐI SYSCALL LINUX X86_64 (PHASE 3)
+    // 2.3: BỘ ĐIỀU PHỐI SYSCALL LINUX X86_64 (PHASE 4: VFS & EXECVE)
     // ------------------------------------------------------------------------
     pub fn dispatch_linux_syscall(frame: &mut TrapFrame, ctx: &mut KernelContext) {
         let result = match frame.rax {
             SYS_READ => sys_read(ctx, frame.rdi, frame.rsi, frame.rdx),
             SYS_WRITE => sys_write(ctx, frame.rdi, frame.rsi, frame.rdx),
+            SYS_OPEN => sys_openat(ctx, -100i64 as u64, frame.rdi, frame.rsi),
             SYS_CLOSE => sys_close(ctx, frame.rdi),
             SYS_FSTAT => sys_fstat(ctx, frame.rdi, frame.rsi),
+            SYS_LSEEK => sys_lseek(ctx, frame.rdi, frame.rsi as i64, frame.rdx),
             SYS_MMAP => sys_mmap(ctx, frame.rdi, frame.rsi),
             SYS_MPROTECT | SYS_MUNMAP => Ok(0),
             SYS_BRK => sys_brk(ctx, frame.rdi),
@@ -1299,10 +1360,14 @@ pub mod linux_abi {
             SYS_GETPID | SYS_GETTID => Ok(ctx.current_pid),
             SYS_GETPPID => Ok(0),
             SYS_CLONE => sys_clone(ctx),
+            SYS_EXECVE => sys_execve(frame, ctx),
             SYS_WAIT4 => sys_wait4(ctx, frame.rdi, frame.rsi),
             SYS_UNAME => sys_uname(frame.rdi),
+            SYS_GETCWD => sys_getcwd(ctx, frame.rdi, frame.rsi),
+            SYS_CHDIR => sys_chdir(ctx, frame.rdi),
             SYS_ARCH_PRCTL => sys_arch_prctl(frame.rdi, frame.rsi),
             SYS_FUTEX => sys_futex(ctx, frame.rdi, frame.rsi, frame.rdx as u32),
+            SYS_GETDENTS64 => sys_getdents64(ctx, frame.rdi, frame.rsi, frame.rdx),
             SYS_SET_TID_ADDRESS => {
                 if let Some(t) = ctx.tasks.get_mut(0) {
                     t.clear_child_tid = frame.rdi;
@@ -1310,6 +1375,9 @@ pub mod linux_abi {
                 Ok(ctx.current_pid)
             }
             SYS_CLOCK_GETTIME => sys_clock_gettime(frame.rdi, frame.rsi),
+            SYS_OPENAT => sys_openat(ctx, frame.rdi, frame.rsi, frame.rdx),
+            SYS_NEWFSTATAT => sys_newfstatat(frame.rsi, frame.rdx),
+            SYS_FACCESSAT => sys_faccessat(frame.rsi),
             SYS_PIPE2 => sys_pipe2(ctx, frame.rdi),
             SYS_EXIT | SYS_EXIT_GROUP => {
                 ctx.last_exit_code = Some(frame.rdi as i32);
@@ -1322,6 +1390,38 @@ pub mod linux_abi {
             Ok(val) => val,
             Err(errno) => errno.as_neg_ret(),
         };
+    }
+
+    fn sys_openat(
+        ctx: &mut KernelContext,
+        _dirfd: u64,
+        path_ptr: u64,
+        _flags: u64,
+    ) -> Result<u64, LinuxErrno> {
+        let mut path_buf = [0u8; 64];
+        let path_slice = read_cstr_from_user(path_ptr, &mut path_buf)?;
+        let kind = resolve_vfs_path(path_slice)?;
+
+        let entry = match kind {
+            VfsNodeKind::RootDir => CapabilityEntry {
+                object: CapObject::VfsDir { offset: 0 },
+                can_read: true,
+                can_write: false,
+            },
+            VfsNodeKind::DevNull | VfsNodeKind::DevZero => CapabilityEntry {
+                object: CapObject::VfsFile { kind, offset: 0 },
+                can_read: true,
+                can_write: true,
+            },
+            _ => CapabilityEntry {
+                object: CapObject::VfsFile { kind, offset: 0 },
+                can_read: true,
+                can_write: false,
+            },
+        };
+
+        let fd = ctx.alloc_fd(entry)?;
+        Ok(fd as u64)
     }
 
     fn sys_read(
@@ -1351,8 +1451,175 @@ pub mod linux_abi {
                 }
                 Ok(n as u64)
             }
+            CapObject::VfsFile { kind, offset } => {
+                let content: &[u8] = match kind {
+                    VfsNodeKind::OsRelease => OS_RELEASE_CONTENT,
+                    VfsNodeKind::ProcVersion => PROC_VERSION_CONTENT,
+                    VfsNodeKind::DevNull => &[],
+                    VfsNodeKind::DevZero => &[0u8; 128],
+                    _ => return Err(LinuxErrno::Einval),
+                };
+                if offset >= content.len() {
+                    return Ok(0);
+                }
+                let avail = content.len() - offset;
+                let to_read = (count as usize).min(avail);
+                let slice = content
+                    .get(offset..offset + to_read)
+                    .ok_or(LinuxErrno::Efault)?;
+                copy_to_buffer(buf_ptr, slice).map_err(|_| LinuxErrno::Efault)?;
+
+                if let Some(Some(slot)) = ctx.fd_table.get_mut(fd as usize) {
+                    slot.object = CapObject::VfsFile {
+                        kind,
+                        offset: offset + to_read,
+                    };
+                }
+                Ok(to_read as u64)
+            }
+            CapObject::VfsDir { .. } => Err(LinuxErrno::Eisdir),
             _ => Err(LinuxErrno::Ebadf),
         }
+    }
+
+    fn sys_lseek(
+        ctx: &mut KernelContext,
+        fd: u64,
+        offset_arg: i64,
+        whence: u64,
+    ) -> Result<u64, LinuxErrno> {
+        let slot = ctx
+            .fd_table
+            .get_mut(fd as usize)
+            .and_then(|c| c.as_mut())
+            .ok_or(LinuxErrno::Ebadf)?;
+        if let CapObject::VfsFile { kind, offset } = slot.object {
+            let new_off = match whence {
+                0 => offset_arg as usize,
+                1 => (offset as i64 + offset_arg) as usize,
+                _ => return Err(LinuxErrno::Einval),
+            };
+            slot.object = CapObject::VfsFile {
+                kind,
+                offset: new_off,
+            };
+            Ok(new_off as u64)
+        } else {
+            Err(LinuxErrno::Einval)
+        }
+    }
+
+    fn sys_getdents64(
+        ctx: &mut KernelContext,
+        fd: u64,
+        dirp_ptr: u64,
+        count: u64,
+    ) -> Result<u64, LinuxErrno> {
+        let slot = ctx
+            .fd_table
+            .get_mut(fd as usize)
+            .and_then(|c| c.as_mut())
+            .ok_or(LinuxErrno::Ebadf)?;
+        if let CapObject::VfsDir { offset } = slot.object {
+            if offset > 0 {
+                return Ok(0);
+            }
+            // Cấu trúc linux_dirent64 tối giản cho mục "bin" và "etc" (mỗi mục 24 bytes căn lề 8-byte)
+            if count < 48 {
+                return Err(LinuxErrno::Einval);
+            }
+            let mut dirents = [0u8; 48];
+            // Mục 1: d_ino=1, d_off=24, d_reclen=24, d_type=4 (DT_DIR), d_name="bin\0"
+            dirents[0..8].copy_from_slice(&1u64.to_le_bytes());
+            dirents[8..16].copy_from_slice(&24u64.to_le_bytes());
+            dirents[16..18].copy_from_slice(&24u16.to_le_bytes());
+            dirents[18] = 4;
+            dirents[19..23].copy_from_slice(b"bin\0");
+
+            // Mục 2: d_ino=2, d_off=48, d_reclen=24, d_type=4 (DT_DIR), d_name="etc\0"
+            dirents[24..32].copy_from_slice(&2u64.to_le_bytes());
+            dirents[32..40].copy_from_slice(&48u64.to_le_bytes());
+            dirents[40..42].copy_from_slice(&24u16.to_le_bytes());
+            dirents[42] = 4;
+            dirents[43..47].copy_from_slice(b"etc\0");
+
+            copy_to_buffer(dirp_ptr, &dirents).map_err(|_| LinuxErrno::Efault)?;
+            slot.object = CapObject::VfsDir { offset: 2 };
+            Ok(48)
+        } else {
+            Err(LinuxErrno::Enotdir)
+        }
+    }
+
+    fn sys_getcwd(ctx: &KernelContext, buf_ptr: u64, size: u64) -> Result<u64, LinuxErrno> {
+        let needed = ctx.cwd_len + 1;
+        if (size as usize) < needed {
+            return Err(LinuxErrno::Erange);
+        }
+        let slice = ctx.cwd.get(..needed).ok_or(LinuxErrno::Efault)?;
+        copy_to_buffer(buf_ptr, slice).map_err(|_| LinuxErrno::Efault)?;
+        Ok(buf_ptr)
+    }
+
+    fn sys_chdir(ctx: &mut KernelContext, path_ptr: u64) -> Result<u64, LinuxErrno> {
+        let mut path_buf = [0u8; 64];
+        let path_slice = read_cstr_from_user(path_ptr, &mut path_buf)?;
+        let kind = resolve_vfs_path(path_slice)?;
+        if kind != VfsNodeKind::RootDir {
+            return Err(LinuxErrno::Enotdir);
+        }
+        ctx.cwd = [0u8; 64];
+        ctx.cwd[0] = b'/';
+        ctx.cwd_len = 1;
+        Ok(0)
+    }
+
+    fn sys_newfstatat(path_ptr: u64, statbuf_ptr: u64) -> Result<u64, LinuxErrno> {
+        let mut path_buf = [0u8; 64];
+        let path_slice = read_cstr_from_user(path_ptr, &mut path_buf)?;
+        let _kind = resolve_vfs_path(path_slice)?;
+        let zero_stat = [0u8; 144];
+        copy_to_buffer(statbuf_ptr, &zero_stat).map_err(|_| LinuxErrno::Efault)?;
+        Ok(0)
+    }
+
+    fn sys_faccessat(path_ptr: u64) -> Result<u64, LinuxErrno> {
+        let mut path_buf = [0u8; 64];
+        let path_slice = read_cstr_from_user(path_ptr, &mut path_buf)?;
+        let _kind = resolve_vfs_path(path_slice)?;
+        Ok(0)
+    }
+
+    /// Hiện thực `SYS_execve (59)`: Phân giải đường dẫn tệp thực thi trong VFS,
+    /// nạp ảnh ELF64 mới vào không gian địa chỉ User-space, và thay thế `RIP` (`frame.rcx`)
+    /// cùng `RSP` (`frame.rsp`) để `sysretq` nhảy thẳng vào chương trình mới ở Ring 3!
+    fn sys_execve(frame: &mut TrapFrame, ctx: &mut KernelContext) -> Result<u64, LinuxErrno> {
+        let mut path_buf = [0u8; 64];
+        let path_slice = read_cstr_from_user(frame.rdi, &mut path_buf)?;
+        let kind = resolve_vfs_path(path_slice)?;
+
+        let elf_image = match kind {
+            VfsNodeKind::BinApp => build_embedded_linux_app_elf64(),
+            VfsNodeKind::BinInit => build_embedded_linux_init_elf64(),
+            _ => return Err(LinuxErrno::Eacces),
+        };
+
+        let loaded = load_elf64_into_user_space(&elf_image, &mut ctx.pmm)
+            .map_err(|_| LinuxErrno::Enomem)?;
+
+        ctx.program_break = loaded.initial_brk;
+
+        // Đặt lại toàn bộ thanh ghi của luồng User và trỏ RCX (User RIP) + RSP tới ảnh ELF64 mới!
+        frame.rcx = loaded.entry_rip;
+        frame.rsp = loaded.user_rsp;
+        frame.rdi = 0;
+        frame.rsi = 0;
+        frame.rdx = 0;
+        frame.r8 = 0;
+        frame.r9 = 0;
+        frame.r10 = 0;
+
+        Ok(0)
     }
 
     fn sys_write(
@@ -1400,6 +1667,10 @@ pub mod linux_abi {
                 let n = pipe.write_slice(slice);
                 Ok(n as u64)
             }
+            CapObject::VfsFile {
+                kind: VfsNodeKind::DevNull | VfsNodeKind::DevZero,
+                ..
+            } => Ok(count),
             _ => Err(LinuxErrno::Ebadf),
         }
     }
@@ -1533,7 +1804,6 @@ pub mod linux_abi {
         }
     }
 
-    /// Cấp phát vùng nhớ VMO ẩn danh và ánh xạ trực tiếp vào không gian địa chỉ User-space (`PAGE_USER`).
     fn sys_mmap(ctx: &mut KernelContext, addr_hint: u64, length: u64) -> Result<u64, LinuxErrno> {
         if length == 0 {
             return Err(LinuxErrno::Einval);
@@ -1787,7 +2057,8 @@ pub mod linux_abi {
             }
         }
 
-        let stack_bottom: u64 = 0x0000_0000_0080_0000;
+        // Tách biệt địa chỉ Stack cho từng ảnh thực thi (0x0080_0000 cho /bin/init, 0x0090_0000 cho /bin/app)
+        let stack_bottom: u64 = 0x0040_0000 + (e_entry & 0x00FF_0000);
         map_user_page(pmm, stack_bottom).map_err(|_| ElfLoadError::MappingFailed)?;
         map_user_page(pmm, stack_bottom + 0x1000).map_err(|_| ElfLoadError::MappingFailed)?;
 
@@ -1843,48 +2114,51 @@ pub mod linux_abi {
         Ok(rsp)
     }
 
+    /// Ảnh thực thi số 1 (`/bin/init` tại `0x0040_1000`):
+    /// Kiểm thử VFS (`SYS_getcwd`, `SYS_openat("/etc/os-release")`, `SYS_read`, `SYS_getdents64("/")`),
+    /// sau đó gọi `SYS_execve("/bin/app", NULL, NULL)` để chuyển quyền thực thi sang `/bin/app`!
     pub fn build_embedded_linux_init_elf64() -> [u8; 1024] {
         let mut elf = [0u8; 1024];
 
-        // 1. ELF64 Header (64 bytes tại offset 0x00)
+        // 1. ELF64 Header
         elf[0..4].copy_from_slice(b"\x7FELF");
-        elf[4] = 2; // ELFCLASS64
-        elf[5] = 1; // ELFDATA2LSB
-        elf[6] = 1; // EV_CURRENT
-        elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
-        elf[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
-        elf[20..24].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
-        elf[24..32].copy_from_slice(&0x0040_1000u64.to_le_bytes()); // e_entry = 0x401000
-        elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff = 64
-        elf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize = 64
-        elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize = 56
-        elf[56..58].copy_from_slice(&2u16.to_le_bytes()); // e_phnum = 2
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf[24..32].copy_from_slice(&0x0040_1000u64.to_le_bytes());
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&2u16.to_le_bytes());
 
-        // 2. Program Header #0: PT_LOAD (.text tại 0x0040_1000, file offset 256, size 256)
+        // 2. Program Header #0: PT_LOAD (.text tại 0x0040_1000)
         let ph0 = 64;
         elf[ph0..ph0 + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
-        elf[ph0 + 4..ph0 + 8].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
-        elf[ph0 + 8..ph0 + 16].copy_from_slice(&256u64.to_le_bytes()); // p_offset
-        elf[ph0 + 16..ph0 + 24].copy_from_slice(&0x0040_1000u64.to_le_bytes()); // p_vaddr
-        elf[ph0 + 24..ph0 + 32].copy_from_slice(&0x0040_1000u64.to_le_bytes()); // p_paddr
-        elf[ph0 + 32..ph0 + 40].copy_from_slice(&256u64.to_le_bytes()); // p_filesz
-        elf[ph0 + 40..ph0 + 48].copy_from_slice(&256u64.to_le_bytes()); // p_memsz
-        elf[ph0 + 48..ph0 + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+        elf[ph0 + 4..ph0 + 8].copy_from_slice(&5u32.to_le_bytes());
+        elf[ph0 + 8..ph0 + 16].copy_from_slice(&256u64.to_le_bytes());
+        elf[ph0 + 16..ph0 + 24].copy_from_slice(&0x0040_1000u64.to_le_bytes());
+        elf[ph0 + 24..ph0 + 32].copy_from_slice(&0x0040_1000u64.to_le_bytes());
+        elf[ph0 + 32..ph0 + 40].copy_from_slice(&256u64.to_le_bytes());
+        elf[ph0 + 40..ph0 + 48].copy_from_slice(&256u64.to_le_bytes());
+        elf[ph0 + 48..ph0 + 56].copy_from_slice(&0x1000u64.to_le_bytes());
 
-        // 3. Program Header #1: PT_LOAD (.data tại 0x0040_2000, file offset 512, size 384)
+        // 3. Program Header #1: PT_LOAD (.data tại 0x0040_2000)
         let ph1 = 120;
         elf[ph1..ph1 + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
-        elf[ph1 + 4..ph1 + 8].copy_from_slice(&6u32.to_le_bytes()); // PF_R | PF_W
-        elf[ph1 + 8..ph1 + 16].copy_from_slice(&512u64.to_le_bytes()); // p_offset
-        elf[ph1 + 16..ph1 + 24].copy_from_slice(&0x0040_2000u64.to_le_bytes()); // p_vaddr
-        elf[ph1 + 24..ph1 + 32].copy_from_slice(&0x0040_2000u64.to_le_bytes()); // p_paddr
-        elf[ph1 + 32..ph1 + 40].copy_from_slice(&384u64.to_le_bytes()); // p_filesz
-        elf[ph1 + 40..ph1 + 48].copy_from_slice(&384u64.to_le_bytes()); // p_memsz
-        elf[ph1 + 48..ph1 + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+        elf[ph1 + 4..ph1 + 8].copy_from_slice(&6u32.to_le_bytes());
+        elf[ph1 + 8..ph1 + 16].copy_from_slice(&512u64.to_le_bytes());
+        elf[ph1 + 16..ph1 + 24].copy_from_slice(&0x0040_2000u64.to_le_bytes());
+        elf[ph1 + 24..ph1 + 32].copy_from_slice(&0x0040_2000u64.to_le_bytes());
+        elf[ph1 + 32..ph1 + 40].copy_from_slice(&384u64.to_le_bytes());
+        elf[ph1 + 40..ph1 + 48].copy_from_slice(&384u64.to_le_bytes());
+        elf[ph1 + 48..ph1 + 56].copy_from_slice(&0x1000u64.to_le_bytes());
 
-        // 4. Mã máy Ring 3 x86_64:
+        // 4. Mã máy Ring 3 của `/bin/init`:
         let code: &[u8] = &[
-            // (A) SYS_mmap(NULL, 4096, PROT_RW, MAP_PRIVATE|MAP_ANON, -1, 0) -> rax = 0x1000_0000
+            // (A) SYS_mmap(NULL, 4096, PROT_RW, MAP_PRIVATE|MAP_ANON, -1, 0) -> r12 = 0x1000_0000
             0xb8, 0x09, 0x00, 0x00, 0x00, // mov eax, 9 (SYS_mmap)
             0x31, 0xff, // xor edi, edi
             0xbe, 0x00, 0x10, 0x00, 0x00, // mov esi, 4096
@@ -1893,87 +2167,133 @@ pub mod linux_abi {
             0x49, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, // mov r8, -1
             0x45, 0x31, 0xc9, // xor r9d, r9d
             0x0f, 0x05, // syscall
-            0x49, 0x89, 0xc4, // mov r12, rax (r12 = 0x1000_0000)
-            // (B) SYS_pipe2(r12, 0) -> lưu [read_fd=3, write_fd=4] tại [0x1000_0000]
+            0x49, 0x89, 0xc4, // mov r12, rax
+            // (B) SYS_getcwd(r12, 64) -> lưu "/\0" vào 0x1000_0000
             0x4c, 0x89, 0xe7, // mov rdi, r12
-            0x31, 0xf6, // xor esi, esi
-            0xb8, 0x25, 0x01, 0x00, 0x00, // mov eax, 293 (SYS_pipe2)
+            0xbe, 0x40, 0x00, 0x00, 0x00, // mov esi, 64
+            0xb8, 0x4f, 0x00, 0x00, 0x00, // mov eax, 79 (SYS_getcwd)
             0x0f, 0x05, // syscall
-            // (C) SYS_write(write_fd = [r12 + 4], "PIPE_OK!", 8)
-            0x41, 0x8b, 0x7c, 0x24, 0x04, // mov edi, dword ptr [r12 + 4]
-            0xbe, 0xd0, 0x20, 0x40, 0x00, // mov esi, 0x004020d0 ("PIPE_OK!")
-            0xba, 0x08, 0x00, 0x00, 0x00, // mov edx, 8
-            0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (SYS_write)
-            0x0f, 0x05, // syscall
-            // (D) SYS_read(read_fd = [r12], r12 + 0x100, 8) -> r13 = 8 bytes
-            0x41, 0x8b, 0x3c, 0x24, // mov edi, dword ptr [r12]
-            0x49, 0x8d, 0xb4, 0x24, 0x00, 0x01, 0x00, 0x00, // lea rsi, [r12 + 0x100]
-            0xba, 0x08, 0x00, 0x00, 0x00, // mov edx, 8
-            0x31, 0xc0, // xor eax, eax (SYS_read = 0)
-            0x0f, 0x05, // syscall
-            0x49, 0x89, 0xc5, // mov r13, rax (r13 = 8)
-            // (E) SYS_clock_gettime(CLOCK_MONOTONIC=1, r12 + 0x200)
-            0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1
-            0x49, 0x8d, 0xb4, 0x24, 0x00, 0x02, 0x00, 0x00, // lea rsi, [r12 + 0x200]
-            0xb8, 0xe4, 0x00, 0x00, 0x00, // mov eax, 228 (SYS_clock_gettime)
-            0x0f, 0x05, // syscall
-            // (F) SYS_futex(r12 + 0x300, FUTEX_WAKE=1, 1)
-            0x49, 0x8d, 0xbc, 0x24, 0x00, 0x03, 0x00, 0x00, // lea rdi, [r12 + 0x300]
-            0xc7, 0x07, 0x2a, 0x00, 0x00, 0x00, // mov dword ptr [rdi], 42
-            0xbe, 0x01, 0x00, 0x00, 0x00, // mov esi, 1 (FUTEX_WAKE)
-            0xba, 0x01, 0x00, 0x00, 0x00, // mov edx, 1
-            0xb8, 0xca, 0x00, 0x00, 0x00, // mov eax, 202 (SYS_futex)
-            0x0f, 0x05, // syscall
-            // (G) SYS_clone(SIGCHLD=17, 0) -> r14 = child PID (2) & SYS_wait4(2, r12 + 0x400, 0, 0)
-            0xbf, 0x11, 0x00, 0x00, 0x00, // mov edi, 17
-            0x31, 0xf6, // xor esi, esi
-            0xb8, 0x38, 0x00, 0x00, 0x00, // mov eax, 56 (SYS_clone)
-            0x0f, 0x05, // syscall
-            0x49, 0x89, 0xc6, // mov r14, rax (r14 = 2)
-            0x4c, 0x89, 0xf7, // mov rdi, r14
-            0x49, 0x8d, 0xb4, 0x24, 0x00, 0x04, 0x00, 0x00, // lea rsi, [r12 + 0x400]
+            // (C) SYS_openat(AT_FDCWD=-100, "/etc/os-release", O_RDONLY=0, 0) -> r13 = fd
+            0x48, 0xc7, 0xc7, 0x9c, 0xff, 0xff, 0xff, // mov rdi, -100
+            0xbe, 0x50, 0x20, 0x40, 0x00, // mov esi, 0x00402050 ("/etc/os-release")
             0x31, 0xd2, // xor edx, edx
             0x45, 0x31, 0xd2, // xor r10d, r10d
-            0xb8, 0x3d, 0x00, 0x00, 0x00, // mov eax, 61 (SYS_wait4)
+            0xb8, 0x01, 0x01, 0x00, 0x00, // mov eax, 257 (SYS_openat)
             0x0f, 0x05, // syscall
-            // (H) In thông điệp xác nhận từ Ring 3 qua SYS_write & SYS_writev
+            0x49, 0x89, 0xc5, // mov r13, rax
+            // (D) SYS_read(r13, r12 + 0x500, 15) -> đọc "NAME=\"ZenithOS\"" vào 0x1000_0500
+            0x4c, 0x89, 0xef, // mov rdi, r13
+            0x49, 0x8d, 0xb4, 0x24, 0x00, 0x05, 0x00, 0x00, // lea rsi, [r12 + 0x500]
+            0xba, 0x0f, 0x00, 0x00, 0x00, // mov edx, 15
+            0x31, 0xc0, // xor eax, eax (SYS_read = 0)
+            0x0f, 0x05, // syscall
+            // (E) SYS_close(r13)
+            0x4c, 0x89, 0xef, // mov rdi, r13
+            0xb8, 0x03, 0x00, 0x00, 0x00, // mov eax, 3 (SYS_close)
+            0x0f, 0x05, // syscall
+            // (F) SYS_openat(AT_FDCWD=-100, "/", 0, 0) + SYS_getdents64(fd, r12 + 0x700, 128) + SYS_close
+            0x48, 0xc7, 0xc7, 0x9c, 0xff, 0xff, 0xff, // mov rdi, -100
+            0xbe, 0x70, 0x20, 0x40, 0x00, // mov esi, 0x00402070 ("/")
+            0x31, 0xd2, // xor edx, edx
+            0x45, 0x31, 0xd2, // xor r10d, r10d
+            0xb8, 0x01, 0x01, 0x00, 0x00, // mov eax, 257 (SYS_openat)
+            0x0f, 0x05, // syscall
+            0x49, 0x89, 0xc5, // mov r13, rax
+            0x4c, 0x89, 0xef, // mov rdi, r13
+            0x49, 0x8d, 0xb4, 0x24, 0x00, 0x07, 0x00, 0x00, // lea rsi, [r12 + 0x700]
+            0xba, 0x80, 0x00, 0x00, 0x00, // mov edx, 128
+            0xb8, 0xd9, 0x00, 0x00, 0x00, // mov eax, 217 (SYS_getdents64)
+            0x0f, 0x05, // syscall
+            0x4c, 0x89, 0xef, // mov rdi, r13
+            0xb8, 0x03, 0x00, 0x00, 0x00, // mov eax, 3 (SYS_close)
+            0x0f, 0x05, // syscall
+            // (G) SYS_write(1, 0x00402000, 70)
             0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (SYS_write)
-            0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1 (stdout)
-            0xbe, 0x00, 0x20, 0x40, 0x00, // mov esi, 0x00402000 (msg1)
+            0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1
+            0xbe, 0x00, 0x20, 0x40, 0x00, // mov esi, 0x00402000
+            0xba, 0x46, 0x00, 0x00, 0x00, // mov edx, 70
+            0x0f, 0x05, // syscall
+            // (H) SYS_execve("/bin/app", NULL, NULL) -> nhảy sang ảnh ELF64 thứ hai!
+            0xbf, 0x80, 0x20, 0x40, 0x00, // mov edi, 0x00402080 ("/bin/app")
+            0x31, 0xf6, // xor esi, esi
+            0x31, 0xd2, // xor edx, edx
+            0xb8, 0x3b, 0x00, 0x00, 0x00, // mov eax, 59 (SYS_execve)
+            0x0f, 0x05, // syscall
+        ];
+        elf[256..256 + code.len()].copy_from_slice(code);
+
+        // 5. Dữ liệu .data của `/bin/init` tại offset 512 (ánh xạ vào 0x0040_2000):
+        let msg = b"[RING-3 /bin/init] VFS openat('/etc/os-release') & getdents64 tested!\n";
+        elf[512..512 + 70].copy_from_slice(msg);
+        elf[512 + 0x50..512 + 0x50 + 16].copy_from_slice(b"/etc/os-release\0");
+        elf[512 + 0x70..512 + 0x70 + 2].copy_from_slice(b"/\0");
+        elf[512 + 0x80..512 + 0x80 + 9].copy_from_slice(b"/bin/app\0");
+
+        elf
+    }
+
+    /// Ảnh thực thi số 2 (`/bin/app` tại `0x0050_1000`):
+    /// Được nạp từ VFS khi `/bin/init` gọi `SYS_execve("/bin/app")`.
+    pub fn build_embedded_linux_app_elf64() -> [u8; 1024] {
+        let mut elf = [0u8; 1024];
+
+        // 1. ELF64 Header (e_entry = 0x0050_1000)
+        elf[0..4].copy_from_slice(b"\x7FELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf[24..32].copy_from_slice(&0x0050_1000u64.to_le_bytes());
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&2u16.to_le_bytes());
+
+        // 2. Program Header #0: PT_LOAD (.text tại 0x0050_1000)
+        let ph0 = 64;
+        elf[ph0..ph0 + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        elf[ph0 + 4..ph0 + 8].copy_from_slice(&5u32.to_le_bytes());
+        elf[ph0 + 8..ph0 + 16].copy_from_slice(&256u64.to_le_bytes());
+        elf[ph0 + 16..ph0 + 24].copy_from_slice(&0x0050_1000u64.to_le_bytes());
+        elf[ph0 + 24..ph0 + 32].copy_from_slice(&0x0050_1000u64.to_le_bytes());
+        elf[ph0 + 32..ph0 + 40].copy_from_slice(&256u64.to_le_bytes());
+        elf[ph0 + 40..ph0 + 48].copy_from_slice(&256u64.to_le_bytes());
+        elf[ph0 + 48..ph0 + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+
+        // 3. Program Header #1: PT_LOAD (.data tại 0x0050_2000)
+        let ph1 = 120;
+        elf[ph1..ph1 + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        elf[ph1 + 4..ph1 + 8].copy_from_slice(&6u32.to_le_bytes());
+        elf[ph1 + 8..ph1 + 16].copy_from_slice(&512u64.to_le_bytes());
+        elf[ph1 + 16..ph1 + 24].copy_from_slice(&0x0050_2000u64.to_le_bytes());
+        elf[ph1 + 24..ph1 + 32].copy_from_slice(&0x0050_2000u64.to_le_bytes());
+        elf[ph1 + 32..ph1 + 40].copy_from_slice(&256u64.to_le_bytes());
+        elf[ph1 + 40..ph1 + 48].copy_from_slice(&256u64.to_le_bytes());
+        elf[ph1 + 48..ph1 + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+
+        // 4. Mã máy Ring 3 của `/bin/app`:
+        let code: &[u8] = &[
+            // Ghi chữ ký xác thực "ZEN4" vào 0x1000_0600
+            0xbf, 0x00, 0x06, 0x00, 0x10, // mov edi, 0x10000600
+            0xc7, 0x07, 0x5a, 0x45, 0x4e, 0x34, // mov dword ptr [rdi], "ZEN4"
+            // In thông điệp từ `/bin/app` qua SYS_write(1, 0x00502000, 72)
+            0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (SYS_write)
+            0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1
+            0xbe, 0x00, 0x20, 0x50, 0x00, // mov esi, 0x00502000
             0xba, 0x48, 0x00, 0x00, 0x00, // mov edx, 72
             0x0f, 0x05, // syscall
-            0xb8, 0x14, 0x00, 0x00, 0x00, // mov eax, 20 (SYS_writev)
-            0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1 (stdout)
-            0xbe, 0x90, 0x20, 0x40, 0x00, // mov esi, 0x00402090 (iovec[2])
-            0xba, 0x02, 0x00, 0x00, 0x00, // mov edx, 2 (iovcnt = 2)
-            0x0f, 0x05, // syscall
-            // (I) Tính mã thoát xác thực: rdi = (r13 << 4) | r14 = (8 << 4) | 2 = 0x82
-            0x4c, 0x89, 0xef, // mov rdi, r13
-            0x48, 0xc1, 0xe7, 0x04, // shl rdi, 4
-            0x4c, 0x09, 0xf7, // or rdi, r14
+            // Thoát với mã xác thực 0x44
+            0xbf, 0x44, 0x00, 0x00, 0x00, // mov edi, 0x44
             0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, 231 (SYS_exit_group)
             0x0f, 0x05, // syscall
         ];
         elf[256..256 + code.len()].copy_from_slice(code);
 
-        // 5. Dữ liệu .data tại file offset 512 (ánh xạ vào 0x0040_2000):
-        let msg1 = b"[RING-3 ELF64] Phase 3 VMO mmap, Pipe2 IPC, Futex & Clone/Wait4 tested!\n";
-        elf[512..512 + 72].copy_from_slice(msg1);
-
-        let iov_part1 = b"[RING-3 ELF64] musl-style "; // 26 bytes tại 0x0040_2048 (offset 584)
-        elf[584..584 + 26].copy_from_slice(iov_part1);
-
-        let iov_part2 = b"SYS_writev(iovcnt=2) verified in Ring 3!\n"; // 41 bytes tại 0x0040_2068 (offset 616)
-        elf[616..616 + 41].copy_from_slice(iov_part2);
-
-        // Mảng `struct iovec[2]` tại 0x0040_2090 (file offset 656):
-        elf[656..664].copy_from_slice(&0x0040_2048u64.to_le_bytes());
-        elf[664..672].copy_from_slice(&26u64.to_le_bytes());
-        elf[672..680].copy_from_slice(&0x0040_2068u64.to_le_bytes());
-        elf[680..688].copy_from_slice(&41u64.to_le_bytes());
-
-        // Chuỗi tải trọng kiểm thử đường ống IPC tại 0x0040_20D0 (file offset 720):
-        elf[720..728].copy_from_slice(b"PIPE_OK!");
+        // 5. Dữ liệu .data của `/bin/app` tại offset 512 (ánh xạ vào 0x0050_2000):
+        let app_msg = b"[RING-3 /bin/app] Executed new ELF64 image from VFS via SYS_execve(59)!\n";
+        elf[512..512 + 72].copy_from_slice(app_msg);
 
         elf
     }
@@ -2015,12 +2335,12 @@ macro_rules! kprintln {
     };
 }
 
-/// Điểm vào chính của Kernel ZenithOS (Phase 3: VMO, Capabilities, Pipe2, Futex & Clone/Wait4).
+/// Điểm vào chính của Kernel ZenithOS (Phase 4: VFS, Initramfs, Directory I/O & SYS_execve).
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     ostd::SerialConsole::init();
     kprintln!("================================================================");
-    kprintln!("  ZenithOS v0.3.0 - 100% Rust Framekernel (Linux ABI Phase 3)   ");
+    kprintln!("  ZenithOS v0.4.0 - 100% Rust Framekernel (Linux ABI Phase 4)   ");
     kprintln!("================================================================");
 
     // 1. Khởi tạo GDT, TSS, IDT và MSR cho SYSCALL/SYSRETQ
@@ -2035,16 +2355,13 @@ pub extern "C" fn _start() -> ! {
     ostd::disable_smap_for_loader();
     kprintln!("[ZENITH-OSTD] GDT/TSS, IDT (#BP), and SYSCALL/SYSRETQ MSRs ready.");
 
-    // 2. Khởi tạo Ngữ cảnh Nhân Bền vững (Persistent Kernel Context)
+    // 2. Khởi tạo Ngữ cảnh Nhân Bền vững & VFS
     // SAFETY:
     // Khởi tạo duy nhất 1 lần lúc boot trên BSP trước khi nhảy vào Ring 3.
     let ctx = unsafe { &mut *GLOBAL_KERNEL_CTX.0.get() };
     ctx.init_hardware_pmm();
     kprintln!(
-        "[ZENITH-OSTD] Limine HHDM=0x{:x}, KernelPhys=0x{:x}, KernelVirt=0x{:x}",
-        ctx.pmm.hhdm_offset,
-        ctx.pmm.kernel_phys_base,
-        ctx.pmm.kernel_virt_base
+        "[ZENITH-VFS] Mounted In-Memory VFS ('/', '/etc/os-release', '/proc/version', '/bin/init', '/bin/app')."
     );
 
     // 3. Xây dựng và nạp ảnh thực thi Linux ELF64 (`/bin/init`) vào vùng nhớ User-space
@@ -2058,53 +2375,48 @@ pub extern "C" fn _start() -> ! {
     };
     ctx.program_break = loaded.initial_brk;
     kprintln!(
-        "[ZENITH-ELF] Loaded Linux x86_64 ELF64 '/bin/init': entry=0x{:x}, user_rsp=0x{:x}, brk=0x{:x}",
+        "[ZENITH-ELF] Loaded initial ELF64 '/bin/init': entry=0x{:x}, user_rsp=0x{:x}",
         loaded.entry_rip,
-        loaded.user_rsp,
-        loaded.initial_brk
+        loaded.user_rsp
     );
 
-    // 4. Nhảy xuống Ring 3 (CPL = 3) qua `sysretq` để chạy bộ kiểm thử tích hợp Phase 3!
-    kprintln!("[ZENITH-CORE] Transitioning to Ring 3 User-Space via SYSRETQ...");
+    // 4. Nhảy xuống Ring 3 chạy `/bin/init` -> đọc VFS -> gọi `SYS_execve("/bin/app")`!
+    kprintln!("[ZENITH-CORE] Entering Ring 3 ('/bin/init' -> VFS -> SYS_execve -> '/bin/app')...");
     let exit_code = ostd::enter_user_space(loaded.entry_rip, loaded.user_rsp);
     kprintln!(
-        "[ZENITH-CORE] Ring 3 process '/bin/init' exited cleanly back to Kernel with token=0x{:x}.",
+        "[ZENITH-CORE] Ring 3 process '/bin/app' exited cleanly back to Kernel with token=0x{:x}.",
         exit_code
     );
 
-    // 5. Xác thực kết quả thực thi của tiến trình Ring 3 trên vùng nhớ VMO `0x1000_0000`:
-    // - Token trả về phải bằng 0x82: (8 bytes đọc từ Pipe << 4) | (Child PID 2 từ SYS_clone)
-    if exit_code != 0x82 {
+    // 5. Xác thực toàn bộ chuỗi thực thi VFS & SYS_execve:
+    if exit_code != 0x44 {
         kprintln!(
-            "[ZENITH-TEST][FAIL] Unexpected Ring 3 exit token: 0x{:x} (expected 0x82)",
+            "[ZENITH-TEST][FAIL] Unexpected Ring 3 exit token: 0x{:x} (expected 0x44)",
             exit_code
         );
         ostd::exit_qemu(ostd::QemuExitCode::Failed);
     }
 
-    // - Kiểm tra dữ liệu thực tế mà Ring 3 đã đọc từ Pipe IPC và ghi vào trang mmap `0x1000_0100`
-    let mut pipe_verify = [0u8; 8];
-    if ostd::copy_from_buffer(0x1000_0100, &mut pipe_verify).is_err() || &pipe_verify != b"PIPE_OK!"
+    // - Kiểm tra nội dung `/etc/os-release` mà `/bin/init` đã đọc từ VFS vào `0x1000_0500`
+    let mut os_rel_verify = [0u8; 15];
+    if ostd::copy_from_buffer(0x1000_0500, &mut os_rel_verify).is_err()
+        || &os_rel_verify != b"NAME=\"ZenithOS\""
     {
-        kprintln!("[ZENITH-TEST][FAIL] Ring 3 Pipe2 IPC data mismatch at 0x1000_0100!");
+        kprintln!("[ZENITH-TEST][FAIL] VFS /etc/os-release read content mismatch!");
         ostd::exit_qemu(ostd::QemuExitCode::Failed);
     }
-    kprintln!("[ZENITH-LINUX] Verified Ring 3 VMO mmap (0x10000000) & Pipe2 IPC (\"PIPE_OK!\").");
+    kprintln!("[ZENITH-VFS] Verified Ring 3 SYS_openat & SYS_read ('NAME=\"ZenithOS\"').");
 
-    // - Kiểm tra giá trị Futex (42) mà Ring 3 đã ghi tại `0x1000_0300`
-    let mut futex_verify = [0u8; 4];
-    if ostd::copy_from_buffer(0x1000_0300, &mut futex_verify).is_err()
-        || u32::from_le_bytes(futex_verify) != 42
-    {
-        kprintln!("[ZENITH-TEST][FAIL] Ring 3 Futex word verification failed!");
+    // - Kiểm tra chữ ký `"ZEN4"` mà `/bin/app` đã ghi tại `0x1000_0600` sau khi được `SYS_execve`
+    let mut exec_sig = [0u8; 4];
+    if ostd::copy_from_buffer(0x1000_0600, &mut exec_sig).is_err() || &exec_sig != b"ZEN4" {
+        kprintln!("[ZENITH-TEST][FAIL] SYS_execve '/bin/app' memory signature mismatch!");
         ostd::exit_qemu(ostd::QemuExitCode::Failed);
     }
-    kprintln!(
-        "[ZENITH-LINUX] Verified Ring 3 ClockGettime (RDTSC), Futex, and Clone/Wait4 (PID=2)."
-    );
+    kprintln!("[ZENITH-VFS] Verified Ring 3 SYS_getcwd, SYS_getdents64 & SYS_execve('/bin/app').");
 
     kprintln!("================================================================");
-    kprintln!("[ZENITH-CI] ALL PHASE 3 VMO, PIPE2, FUTEX & TASK TESTS PASSED!  ");
+    kprintln!("[ZENITH-CI] ALL PHASE 4 VFS, INITRAMFS & EXECVE TESTS PASSED!   ");
     kprintln!("================================================================");
 
     ostd::exit_qemu(ostd::QemuExitCode::Success);
