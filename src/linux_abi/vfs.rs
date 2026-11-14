@@ -3,23 +3,19 @@
 use crate::linux_abi::LinuxErrno;
 use crate::ostd::copy_from_buffer;
 
-/// ZenithOS Passwordless Capability Security Bitmask (`Z-Cap`).
-/// Replaces traditional Linux `sudo` password prompts with scoped per-process capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ZCapRights(pub u64);
 
 impl ZCapRights {
-    /// Allows reading and writing files inside `/home` and `/tmp` without elevation.
     pub const FS_USER_HOME: u64 = 1 << 0;
-    /// Allows installing verified `.deb` packages into `/usr/bin` without `sudo`.
     pub const PKG_INSTALL: u64 = 1 << 1;
-    /// Allows accessing `/dev/fb0` and `/dev/input/event0` for desktop UI applications.
     pub const DEV_DESKTOP_UI: u64 = 1 << 2;
-    /// Allows modifying immutable system files (`/etc`, `/boot`). Disabled for normal apps!
     pub const SYS_ADMIN_IMMUTABLE: u64 = 1 << 3;
+    pub const DISK_INSTALLER: u64 = 1 << 4;
 
-    pub const DEFAULT_DESKTOP_USER: Self =
-        Self(Self::FS_USER_HOME | Self::PKG_INSTALL | Self::DEV_DESKTOP_UI);
+    pub const DEFAULT_DESKTOP_USER: Self = Self(
+        Self::FS_USER_HOME | Self::PKG_INSTALL | Self::DEV_DESKTOP_UI | Self::DISK_INSTALLER,
+    );
 
     #[inline]
     pub const fn has(self, flag: u64) -> bool {
@@ -32,10 +28,12 @@ pub enum VfsNodeKind {
     RootDir,
     OsRelease,
     ProcVersion,
+    EfiSecureBoot,
     ZenithFsInode(usize),
     DevNull,
     DevZero,
     DevFb0,
+    DevVda,
     DevInputEvent0,
     BinInit,
     BinApp,
@@ -52,6 +50,7 @@ pub enum CapObject {
     VfsFile { kind: VfsNodeKind, offset: usize },
     VfsDir { offset: usize },
     EpollInstance,
+    MemFd { base_va: u64, size: usize },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -146,7 +145,7 @@ impl PipeRingBuffer {
 }
 
 pub const OS_RELEASE_CONTENT: &[u8] =
-    b"NAME=\"ZenithOS\"\nVERSION=\"1.1.0 (Trixie)\"\nID=zenith\nID_LIKE=debian\nPRETTY_NAME=\"ZenithOS 1.1.0 (Debian 13 Trixie amd64)\"\n";
+    b"NAME=\"ZenithOS\"\nVERSION=\"1.5.0 (Trixie)\"\nID=zenith\nID_LIKE=debian\nPRETTY_NAME=\"ZenithOS 1.5.0 (Debian 13 Trixie amd64)\"\n";
 pub const PROC_VERSION_CONTENT: &[u8] =
     b"Linux version 6.8.0-zenith-framekernel (rust@zenith) #1 SMP PREEMPT_DYNAMIC\n";
 
@@ -157,11 +156,13 @@ pub fn resolve_vfs_path(path: &[u8]) -> Result<VfsNodeKind, LinuxErrno> {
         b"/etc/debian_version" | b"etc/debian_version" => Ok(VfsNodeKind::ZenithFsInode(0)),
         b"/etc/apt/sources.list" => Ok(VfsNodeKind::ZenithFsInode(1)),
         b"/var/lib/dpkg/status" => Ok(VfsNodeKind::ZenithFsInode(2)),
-        b"/proc/filesystems" => Ok(VfsNodeKind::ZenithFsInode(3)),
+        b"/etc/fstab" | b"/proc/filesystems" => Ok(VfsNodeKind::ZenithFsInode(3)),
         b"/proc/version" | b"proc/version" => Ok(VfsNodeKind::ProcVersion),
+        b"/sys/firmware/efi/efivars/SecureBoot" => Ok(VfsNodeKind::EfiSecureBoot),
         b"/dev/null" => Ok(VfsNodeKind::DevNull),
         b"/dev/zero" => Ok(VfsNodeKind::DevZero),
         b"/dev/fb0" => Ok(VfsNodeKind::DevFb0),
+        b"/dev/vda" => Ok(VfsNodeKind::DevVda),
         b"/dev/input/event0" => Ok(VfsNodeKind::DevInputEvent0),
         b"/bin/init" => Ok(VfsNodeKind::BinInit),
         b"/bin/app" | b"/bin/gui_app" => Ok(VfsNodeKind::BinApp),
@@ -170,7 +171,6 @@ pub fn resolve_vfs_path(path: &[u8]) -> Result<VfsNodeKind, LinuxErrno> {
     }
 }
 
-/// Reads a null-terminated C string byte-by-byte from user space without crossing unmapped page boundaries.
 pub fn read_cstr_from_user(user_ptr: u64, buf: &mut [u8; 64]) -> Result<&[u8], LinuxErrno> {
     let mut len = 0;
     while len < buf.len() {
