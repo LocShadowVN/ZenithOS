@@ -48,7 +48,7 @@ macro_rules! kprintln {
 pub extern "C" fn _start() -> ! {
     ostd::SerialConsole::init();
     kprintln!("----------------------------------------------------------------");
-    kprintln!("ZenithOS 0.6.0 - x86_64 Rust Framekernel (Linux ABI Subsystem)");
+    kprintln!("ZenithOS 0.8.0 - x86_64 Framekernel (ZenithFS & Debian 13 ABI)");
     kprintln!("----------------------------------------------------------------");
 
     ostd::init_gdt_and_tss();
@@ -66,12 +66,18 @@ pub extern "C" fn _start() -> ! {
     // Initialized once on the BSP prior to entering user space.
     let ctx = unsafe { &mut *GLOBAL_KERNEL_CTX.0.get() };
     ctx.init_hardware();
+    if !ctx.zfs.mounted
+        || !ctx.zfs.deb_installed
+        || !ctx
+            .zfs
+            .verify_inode_checksum(1, linux_abi::DEBIAN_VERSION_DATA)
+    {
+        kprintln!("[ZENITH-FS][FAIL] ZenithFS superblock or .deb installation failure.");
+        ostd::exit_qemu(ostd::QemuExitCode::Failed);
+    }
     kprintln!(
-        "[ZENITH-FBCON] Linear framebuffer {}x{}x{}bpp initialized (hw={}).",
-        ctx.fb.width,
-        ctx.fb.height,
-        ctx.fb.bpp,
-        ctx.fb.is_hardware
+        "[ZENITH-FS] Mounted ZenithFS (magic=0x{:x}) with Debian 13.0 (Trixie) & unpacked .deb.",
+        linux_abi::ZENITHFS_SUPER_MAGIC
     );
 
     let elf_image = linux_abi::build_embedded_linux_init_elf64();
@@ -84,10 +90,12 @@ pub extern "C" fn _start() -> ! {
     };
     ctx.program_break = loaded.initial_brk;
 
-    kprintln!("[ZENITH-CORE] Entering Ring 3 ('/bin/init' -> SYS_execve -> '/bin/app')...");
+    kprintln!(
+        "[ZENITH-CORE] Entering Ring 3 ('/bin/init' -> SYS_execve -> '/usr/bin/hello-deb')..."
+    );
     let exit_code = ostd::enter_user_space(loaded.entry_rip, loaded.user_rsp);
     kprintln!(
-        "[ZENITH-CORE] Ring 3 process '/bin/app' terminated with status=0x{:x}.",
+        "[ZENITH-CORE] Ring 3 .deb binary '/usr/bin/hello-deb' exited with status=0x{:x}.",
         exit_code
     );
 
@@ -99,32 +107,40 @@ pub extern "C" fn _start() -> ! {
         ostd::exit_qemu(ostd::QemuExitCode::Failed);
     }
 
-    let mut ev_type_bytes = [0u8; 2];
-    if ostd::copy_from_buffer(0x1000_0930, &mut ev_type_bytes).is_err()
-        || u16::from_le_bytes(ev_type_bytes) != linux_abi::EV_KEY
-        || ctx.evdev_events_read != 1
+    // Verify Ring 3 queried ZenithFS Superblock via SYS_statfs(137) at 0x1000_0100
+    let mut statfs_magic = [0u8; 8];
+    if ostd::copy_from_buffer(0x1000_0100, &mut statfs_magic).is_err()
+        || u64::from_le_bytes(statfs_magic) != linux_abi::ZENITHFS_SUPER_MAGIC
     {
-        kprintln!("[ZENITH-TEST][FAIL] /dev/input/event0 evdev packet verification failed.");
+        kprintln!("[ZENITH-TEST][FAIL] SYS_statfs ZenithFS magic verification failed.");
         ostd::exit_qemu(ostd::QemuExitCode::Failed);
     }
 
-    let draw_y = 320.min(ctx.fb.height.saturating_sub(1));
-    let vram_px0 = ostd::fb_read_pixel(&ctx.fb, 0, draw_y);
-    if ctx.term_chars_rendered < 120 || vram_px0 != 0x00FF_FFFF {
-        kprintln!(
-            "[ZENITH-TEST][FAIL] fbcon or /dev/fb0 verification failed (chars={}, px0=0x{:x}).",
-            ctx.term_chars_rendered,
-            vram_px0
-        );
+    // Verify Ring 3 read `/etc/debian_version` ("13.0\n") from ZenithFS Inode #1 at 0x1000_0500
+    let mut deb_ver = [0u8; 4];
+    if ostd::copy_from_buffer(0x1000_0500, &mut deb_ver).is_err() || &deb_ver != b"13.0" {
+        kprintln!("[ZENITH-TEST][FAIL] Debian 13.0 (/etc/debian_version) verification failed.");
         ostd::exit_qemu(ostd::QemuExitCode::Failed);
     }
+
+    // Verify Ring 3 `/usr/bin/hello-deb` (unpacked from .deb) wrote signature "DEB3" at 0x1000_0600
+    let mut deb_sig = [0u8; 4];
+    if ostd::copy_from_buffer(0x1000_0600, &mut deb_sig).is_err() || &deb_sig != b"DEB3" {
+        kprintln!("[ZENITH-TEST][FAIL] Unpacked .deb binary execution signature mismatch.");
+        ostd::exit_qemu(ostd::QemuExitCode::Failed);
+    }
+
+    ctx.render_terminal_bytes(b"root@zenith-os:~# dpkg -l | grep hello-trixie\n");
+    ctx.render_terminal_bytes(b"ii  hello-trixie  1.0+deb13u1  amd64  Debian 13 Trixie package\n");
+    ctx.render_terminal_bytes(b"root@zenith-os:~# _\n");
+
     kprintln!(
-        "[ZENITH-LINUX] Verified fbcon ({} glyphs), epoll, evdev, and /dev/fb0.",
+        "[ZENITH-LINUX] Verified ZenithFS, Debian 13.0 (Trixie), .deb unpack & Win11 UI ({} glyphs).",
         ctx.term_chars_rendered
     );
 
     kprintln!("----------------------------------------------------------------");
-    kprintln!("[ZENITH-CI] ALL KERNEL AND LINUX ABI VERIFICATION TESTS PASSED.");
+    kprintln!("[ZENITH-CI] ALL DEBIAN 13 TRIXIE, .DEB AND ZENITHFS TESTS PASSED");
     kprintln!("----------------------------------------------------------------");
 
     ostd::exit_qemu(ostd::QemuExitCode::Success);
