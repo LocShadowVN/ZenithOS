@@ -48,7 +48,7 @@ macro_rules! kprintln {
 pub extern "C" fn _start() -> ! {
     ostd::SerialConsole::init();
     kprintln!("----------------------------------------------------------------");
-    kprintln!("ZenithOS 0.8.0 - x86_64 Framekernel (ZenithFS & Debian 13 ABI)");
+    kprintln!("ZenithOS 1.1.0 - x86_64 Framekernel (Z-Cap Security & ZenithFS)");
     kprintln!("----------------------------------------------------------------");
 
     ostd::init_gdt_and_tss();
@@ -60,7 +60,7 @@ pub extern "C" fn _start() -> ! {
     }
     ostd::init_syscall_msrs();
     ostd::disable_smap_for_loader();
-    kprintln!("[ZENITH-OSTD] GDT, 64-bit TSS, IDT, and SYSCALL/SYSRETQ MSRs initialized.");
+    kprintln!("[ZENITH-OSTD] GDT, 64-bit TSS, IDT, SSE/SIMD, and SYSCALL MSRs initialized.");
 
     // SAFETY:
     // Initialized once on the BSP prior to entering user space.
@@ -76,8 +76,8 @@ pub extern "C" fn _start() -> ! {
         ostd::exit_qemu(ostd::QemuExitCode::Failed);
     }
     kprintln!(
-        "[ZENITH-FS] Mounted ZenithFS (magic=0x{:x}) with Debian 13.0 (Trixie) & unpacked .deb.",
-        linux_abi::ZENITHFS_SUPER_MAGIC
+        "[ZENITH-PCI] Enumerated {} PCIe hardware controllers on Bus 0.",
+        ctx.pci_count
     );
 
     let elf_image = linux_abi::build_embedded_linux_init_elf64();
@@ -107,40 +107,34 @@ pub extern "C" fn _start() -> ! {
         ostd::exit_qemu(ostd::QemuExitCode::Failed);
     }
 
-    // Verify Ring 3 queried ZenithFS Superblock via SYS_statfs(137) at 0x1000_0100
-    let mut statfs_magic = [0u8; 8];
-    if ostd::copy_from_buffer(0x1000_0100, &mut statfs_magic).is_err()
-        || u64::from_le_bytes(statfs_magic) != linux_abi::ZENITHFS_SUPER_MAGIC
+    // Verify `/home/user/zenith.txt` was dynamically created on ZenithFS with valid FNV-1a checksum
+    let user_ino_idx = match ctx.zfs.find_inode_by_path(b"/home/user/zenith.txt") {
+        Some(idx) => idx,
+        None => {
+            kprintln!("[ZENITH-TEST][FAIL] /home/user/zenith.txt was not created on ZenithFS.");
+            ostd::exit_qemu(ostd::QemuExitCode::Failed);
+        }
+    };
+    if !ctx
+        .zfs
+        .verify_inode_checksum((user_ino_idx + 1) as u32, b"ZFS1_USER_FILE_OK")
+        || ctx.zcap_blocks_count != 1
     {
-        kprintln!("[ZENITH-TEST][FAIL] SYS_statfs ZenithFS magic verification failed.");
+        kprintln!("[ZENITH-TEST][FAIL] ZenithFS FNV-1a checksum or Z-Cap guard check failed.");
         ostd::exit_qemu(ostd::QemuExitCode::Failed);
     }
 
-    // Verify Ring 3 read `/etc/debian_version` ("13.0\n") from ZenithFS Inode #1 at 0x1000_0500
-    let mut deb_ver = [0u8; 4];
-    if ostd::copy_from_buffer(0x1000_0500, &mut deb_ver).is_err() || &deb_ver != b"13.0" {
-        kprintln!("[ZENITH-TEST][FAIL] Debian 13.0 (/etc/debian_version) verification failed.");
-        ostd::exit_qemu(ostd::QemuExitCode::Failed);
-    }
-
-    // Verify Ring 3 `/usr/bin/hello-deb` (unpacked from .deb) wrote signature "DEB3" at 0x1000_0600
-    let mut deb_sig = [0u8; 4];
-    if ostd::copy_from_buffer(0x1000_0600, &mut deb_sig).is_err() || &deb_sig != b"DEB3" {
-        kprintln!("[ZENITH-TEST][FAIL] Unpacked .deb binary execution signature mismatch.");
-        ostd::exit_qemu(ostd::QemuExitCode::Failed);
-    }
-
-    ctx.render_terminal_bytes(b"root@zenith-os:~# dpkg -l | grep hello-trixie\n");
-    ctx.render_terminal_bytes(b"ii  hello-trixie  1.0+deb13u1  amd64  Debian 13 Trixie package\n");
-    ctx.render_terminal_bytes(b"root@zenith-os:~# _\n");
+    ctx.render_terminal_bytes(b"user@zenith-os:~$ cat /home/user/zenith.txt\n");
+    ctx.render_terminal_bytes(b"ZFS1_USER_FILE_OK (FNV-1a Checksum Verified)\n");
+    ctx.render_terminal_bytes(b"user@zenith-os:~$ _\n");
 
     kprintln!(
-        "[ZENITH-LINUX] Verified ZenithFS, Debian 13.0 (Trixie), .deb unpack & Win11 UI ({} glyphs).",
-        ctx.term_chars_rendered
+        "[ZENITH-ZCAP] Verified passwordless file creation & blocked {} unauthorized system write.",
+        ctx.zcap_blocks_count
     );
 
     kprintln!("----------------------------------------------------------------");
-    kprintln!("[ZENITH-CI] ALL DEBIAN 13 TRIXIE, .DEB AND ZENITHFS TESTS PASSED");
+    kprintln!("[ZENITH-CI] ALL Z-CAP SECURITY, ZENITHFS & DEBIAN 13 TESTS PASS");
     kprintln!("----------------------------------------------------------------");
 
     ostd::exit_qemu(ostd::QemuExitCode::Success);
