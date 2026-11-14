@@ -82,6 +82,13 @@ pub const fn ascii_to_glyph_8x8(ch: u8) -> [u8; 8] {
         b'7' => [0x7E, 0x06, 0x0C, 0x18, 0x30, 0x30, 0x30, 0x00],
         b'8' => [0x3C, 0x66, 0x66, 0x3C, 0x66, 0x66, 0x3C, 0x00],
         b'9' => [0x3C, 0x66, 0x66, 0x3E, 0x06, 0x06, 0x3C, 0x00],
+        b'$' => [0x18, 0x3E, 0x60, 0x3C, 0x06, 0x7C, 0x18, 0x00],
+        b'%' => [0x62, 0x64, 0x08, 0x10, 0x26, 0x46, 0x00, 0x00],
+        b'^' => [0x18, 0x3C, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00],
+        b'*' => [0x00, 0x66, 0x3C, 0xFF, 0x3C, 0x66, 0x00, 0x00],
+        b'|' => [0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00],
+        b'?' => [0x3C, 0x66, 0x06, 0x1C, 0x18, 0x00, 0x18, 0x00],
+        b';' => [0x00, 0x18, 0x18, 0x00, 0x18, 0x18, 0x30, 0x00],
         b'&' => [0x38, 0x6C, 0x38, 0x76, 0xDC, 0xCC, 0x76, 0x00],
         b'=' => [0x00, 0x00, 0x7E, 0x00, 0x7E, 0x00, 0x00, 0x00],
         b'+' => [0x00, 0x18, 0x18, 0x7E, 0x18, 0x18, 0x00, 0x00],
@@ -140,6 +147,71 @@ pub fn draw_text_line(fb: &FramebufferInfo, text: &[u8], x0: u32, y0: u32, color
                 color,
             },
         );
+    }
+}
+
+/// Renders a Windows 11 high-contrast arrow mouse cursor with black outline and white fill.
+pub fn draw_mouse_cursor(fb: &FramebufferInfo, x0: u32, y0: u32) {
+    let outline: [u16; 14] = [
+        0b1000_0000_0000_0000,
+        0b1100_0000_0000_0000,
+        0b1010_0000_0000_0000,
+        0b1001_0000_0000_0000,
+        0b1000_1000_0000_0000,
+        0b1000_0100_0000_0000,
+        0b1000_0010_0000_0000,
+        0b1000_0001_0000_0000,
+        0b1000_0000_1000_0000,
+        0b1000_0111_1100_0000,
+        0b1001_0100_0000_0000,
+        0b1010_0100_0000_0000,
+        0b1100_0010_0000_0000,
+        0b0000_0011_0000_0000,
+    ];
+    let fill: [u16; 14] = [
+        0b0000_0000_0000_0000,
+        0b0000_0000_0000_0000,
+        0b0100_0000_0000_0000,
+        0b0110_0000_0000_0000,
+        0b0111_0000_0000_0000,
+        0b0111_1000_0000_0000,
+        0b0111_1100_0000_0000,
+        0b0111_1110_0000_0000,
+        0b0111_1111_0000_0000,
+        0b0111_1000_0000_0000,
+        0b0110_0000_0000_0000,
+        0b0100_0000_0000_0000,
+        0b0000_0000_0000_0000,
+        0b0000_0000_0000_0000,
+    ];
+
+    for (r, (&o_bits, &f_bits)) in outline.iter().zip(fill.iter()).enumerate() {
+        for c in 0..12u32 {
+            let mask = 1u16 << (15 - c);
+            if (f_bits & mask) != 0 {
+                fb_fill_rect(
+                    fb,
+                    Rect {
+                        x: x0 + c,
+                        y: y0 + r as u32,
+                        w: 1,
+                        h: 1,
+                    },
+                    0x00FF_FFFF,
+                );
+            } else if (o_bits & mask) != 0 {
+                fb_fill_rect(
+                    fb,
+                    Rect {
+                        x: x0 + c,
+                        y: y0 + r as u32,
+                        w: 1,
+                        h: 1,
+                    },
+                    0x0000_0000,
+                );
+            }
+        }
     }
 }
 
@@ -328,7 +400,6 @@ const fn hex_nibble(n: u8) -> u8 {
 }
 
 fn draw_desktop_shortcuts(fb: &FramebufferInfo) {
-    // 1. "This PC" icon
     fb_fill_rect(
         fb,
         Rect {
@@ -361,7 +432,6 @@ fn draw_desktop_shortcuts(fb: &FramebufferInfo) {
     );
     draw_text_line(fb, b"This PC", 16, 64, 0x00F3_F4F6);
 
-    // 2. "Files" Folder icon
     fb_fill_rect(
         fb,
         Rect {
@@ -384,7 +454,6 @@ fn draw_desktop_shortcuts(fb: &FramebufferInfo) {
     );
     draw_text_line(fb, b"Files", 22, 132, 0x00F3_F4F6);
 
-    // 3. "Settings" icon
     fb_fill_rect(
         fb,
         Rect {
@@ -408,7 +477,6 @@ fn draw_files_app(fb: &FramebufferInfo, x: u32, y: u32, w: u32, h: u32) {
         0x00F5_B942,
     );
 
-    // Address & Navigation Bar
     fb_fill_rect(
         fb,
         Rect {
@@ -427,8 +495,7 @@ fn draw_files_app(fb: &FramebufferInfo, x: u32, y: u32, w: u32, h: u32) {
         0x00D1_D5DB,
     );
 
-    // Left Sidebar Navigation
-    let side_w = 136u32;
+    let side_w = 132u32;
     fb_fill_rect(
         fb,
         Rect {
@@ -455,11 +522,10 @@ fn draw_files_app(fb: &FramebufferInfo, x: u32, y: u32, w: u32, h: u32) {
     draw_text_line(fb, b" Debian Apps", x + 12, y + 136, 0x00D1_D5DB);
     draw_text_line(fb, b" Local Disk Z:", x + 12, y + 156, 0x009E_CE6A);
 
-    // Main File Table
-    let list_x = x + side_w + 16;
+    let list_x = x + side_w + 14;
     draw_text_line(
         fb,
-        b"Name                Type           Size    Security",
+        b"Name              Type          Size   Security",
         list_x,
         y + 76,
         0x009C_A3AF,
@@ -469,7 +535,7 @@ fn draw_files_app(fb: &FramebufferInfo, x: u32, y: u32, w: u32, h: u32) {
         Rect {
             x: list_x,
             y: y + 88,
-            w: w.saturating_sub(side_w + 28),
+            w: w.saturating_sub(side_w + 26),
             h: 1,
         },
         0x002B_2F3A,
@@ -477,28 +543,28 @@ fn draw_files_app(fb: &FramebufferInfo, x: u32, y: u32, w: u32, h: u32) {
 
     draw_text_line(
         fb,
-        b"zenith.txt          Text File      17 B    Z-Cap Home R/W",
+        b"zenith.txt        Text File     17 B   Z-Cap R/W",
         list_x,
         y + 100,
         0x009E_CE6A,
     );
     draw_text_line(
         fb,
-        b"hello-deb           Debian 13 App  4 KB    Verified .deb",
+        b"hello-deb         Debian App    4 KB   Verified",
         list_x,
         y + 118,
         0x0060_CDFF,
     );
     draw_text_line(
         fb,
-        b"sources.list        APT Repo Cfg   70 B    Immutable Sys",
+        b"sources.list      APT Config    70 B   Immutable",
         list_x,
         y + 136,
         0x00E5_E7EB,
     );
     draw_text_line(
         fb,
-        b"debian_version      OS Release     5 B     Immutable Sys",
+        b"debian_version    OS Release    5 B    Immutable",
         list_x,
         y + 154,
         0x00E5_E7EB,
@@ -518,7 +584,7 @@ fn draw_settings_app(fb: &FramebufferInfo, x: u32, y: u32, w: u32, h: u32, state
     let cy = y + 48;
 
     draw_stylized_zenith_logo(fb, cx, cy, 2);
-    draw_text_line(fb, b"ZenithOS 1.2 LTS (x86_64)", cx + 42, cy + 4, 0x00FFFFFF);
+    draw_text_line(fb, b"ZenithOS 1.3 LTS (x86_64)", cx + 42, cy + 4, 0x00FFFFFF);
     draw_text_line(
         fb,
         b"Debian 13 (Trixie) + Z-Cap Passwordless Security",
@@ -527,7 +593,6 @@ fn draw_settings_app(fb: &FramebufferInfo, x: u32, y: u32, w: u32, h: u32, state
         0x0060_CDFF,
     );
 
-    // Hardware CPUID & CMOS RTC Telemetry Card
     fb_fill_rect(
         fb,
         Rect {
@@ -548,13 +613,12 @@ fn draw_settings_app(fb: &FramebufferInfo, x: u32, y: u32, w: u32, h: u32, state
     draw_text_line(fb, &time_str, cx + 276, cy + 90, 0x0060_CDFF);
     draw_text_line(
         fb,
-        b"Security Mode: Z-Cap Scoped Token (No sudo prompt)",
+        b"Memory & Security: 128 MB RAM | Z-Cap Active",
         cx + 10,
         cy + 108,
         0x00E5_E7EB,
     );
 
-    // Active Hardware Drivers Section (2013-2026 Hardware Support)
     draw_text_line(
         fb,
         b"Bound PCIe & Platform Drivers (2013-2026 ISA):",
@@ -591,7 +655,6 @@ fn draw_settings_app(fb: &FramebufferInfo, x: u32, y: u32, w: u32, h: u32, state
         0x009E_CE6A,
     );
 
-    // Storage Bar
     draw_text_line(
         fb,
         b"ZenithFS (Z:) Partition Health: 100% (FNV-1a Verified)",
@@ -626,7 +689,6 @@ pub fn init_fbcon(fb: &FramebufferInfo, state: DesktopState) {
     let taskbar_h = 46u32;
     let desktop_h = fb.height.saturating_sub(taskbar_h);
 
-    // 1. Smooth Per-Scanline Windows 11 Dark Bloom Gradient Wallpaper
     for py in 0..desktop_h {
         let r = 8 + (py * 10) / desktop_h.max(1);
         let g = 16 + (py * 24) / desktop_h.max(1);
@@ -644,13 +706,8 @@ pub fn init_fbcon(fb: &FramebufferInfo, state: DesktopState) {
         );
     }
 
-    // 2. Desktop Shortcut Icons (This PC, Files, Settings)
     draw_desktop_shortcuts(fb);
 
-    // 3. Built-in Default Apps Layout:
-    //    - Top-Left: Files (File Explorer)
-    //    - Bottom-Left: Terminal
-    //    - Right: Settings & Hardware Drivers
     let left_col_x = 84u32;
     let left_col_w = ((fb.width * 54) / 100).saturating_sub(left_col_x).max(320);
     let files_h = 200u32;
@@ -666,7 +723,7 @@ pub fn init_fbcon(fb: &FramebufferInfo, state: DesktopState) {
             w: left_col_w,
             h: term_h,
         },
-        b"Terminal - user@zenith-os: ~ (UID=1000 Z-Cap)",
+        b"Terminal - user@zenith-os: ~ (zsh Interactive Shell)",
         0x000B_0D13,
         0x0000_78D4,
     );
@@ -684,7 +741,9 @@ pub fn init_fbcon(fb: &FramebufferInfo, state: DesktopState) {
         );
     }
 
-    // 4. Windows 11 Bottom Taskbar with Live CMOS RTC Clock & Date
+    // Draw Windows 11 Mouse Cursor hovering near the center of the screen
+    draw_mouse_cursor(fb, fb.width / 2 - 20, desktop_h / 2 - 10);
+
     let tb_y = desktop_h;
     fb_fill_rect(
         fb,
@@ -709,7 +768,6 @@ pub fn init_fbcon(fb: &FramebufferInfo, state: DesktopState) {
 
     let center_x = (fb.width / 2).saturating_sub(120);
 
-    // Stylized "Z" Start Button
     fb_fill_rect(
         fb,
         Rect {
@@ -722,7 +780,6 @@ pub fn init_fbcon(fb: &FramebufferInfo, state: DesktopState) {
     );
     draw_stylized_zenith_logo(fb, center_x + 2, tb_y + 15, 1);
 
-    // Search Pill
     fb_fill_rect(
         fb,
         Rect {
@@ -735,7 +792,6 @@ pub fn init_fbcon(fb: &FramebufferInfo, state: DesktopState) {
     );
     draw_text_line(fb, b"Search", center_x + 52, tb_y + 19, 0x009C_A3AF);
 
-    // Pinned App 1: Files
     let files_ic_x = center_x + 148;
     fb_fill_rect(
         fb,
@@ -758,7 +814,6 @@ pub fn init_fbcon(fb: &FramebufferInfo, state: DesktopState) {
         0x0060_CDFF,
     );
 
-    // Pinned App 2: Terminal
     let term_ic_x = center_x + 184;
     fb_fill_rect(
         fb,
@@ -782,7 +837,6 @@ pub fn init_fbcon(fb: &FramebufferInfo, state: DesktopState) {
         0x0060_CDFF,
     );
 
-    // Pinned App 3: Settings
     let set_ic_x = center_x + 222;
     fb_fill_rect(
         fb,
@@ -806,7 +860,6 @@ pub fn init_fbcon(fb: &FramebufferInfo, state: DesktopState) {
         0x0060_CDFF,
     );
 
-    // Right System Tray: Z-CAP | ENG | Two-Line Live CMOS Clock & Date
     if fb.width > 260 {
         draw_text_line(
             fb,
