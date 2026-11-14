@@ -8,12 +8,17 @@ pub enum VfsNodeKind {
     RootDir,
     OsRelease,
     ProcVersion,
+    ProcFilesystems,
+    DebianVersion,
+    AptSourcesList,
+    DpkgStatus,
     DevNull,
     DevZero,
     DevFb0,
     DevInputEvent0,
     BinInit,
     BinApp,
+    UsrBinHelloDeb,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +125,7 @@ impl PipeRingBuffer {
 }
 
 pub const OS_RELEASE_CONTENT: &[u8] =
-    b"NAME=\"ZenithOS\"\nVERSION=\"0.6.0\"\nID=zenith\nPRETTY_NAME=\"ZenithOS 0.6.0\"\n";
+    b"NAME=\"ZenithOS\"\nVERSION=\"0.8.0 (Trixie)\"\nID=zenith\nID_LIKE=debian\nPRETTY_NAME=\"ZenithOS 0.8.0 (Debian 13 Trixie amd64)\"\n";
 pub const PROC_VERSION_CONTENT: &[u8] =
     b"Linux version 6.8.0-zenith-framekernel (rust@zenith) #1 SMP PREEMPT_DYNAMIC\n";
 
@@ -128,13 +133,18 @@ pub fn resolve_vfs_path(path: &[u8]) -> Result<VfsNodeKind, LinuxErrno> {
     match path {
         b"/" | b"." => Ok(VfsNodeKind::RootDir),
         b"/etc/os-release" | b"etc/os-release" => Ok(VfsNodeKind::OsRelease),
+        b"/etc/debian_version" | b"etc/debian_version" => Ok(VfsNodeKind::DebianVersion),
+        b"/etc/apt/sources.list" => Ok(VfsNodeKind::AptSourcesList),
+        b"/var/lib/dpkg/status" => Ok(VfsNodeKind::DpkgStatus),
         b"/proc/version" | b"proc/version" => Ok(VfsNodeKind::ProcVersion),
+        b"/proc/filesystems" => Ok(VfsNodeKind::ProcFilesystems),
         b"/dev/null" => Ok(VfsNodeKind::DevNull),
         b"/dev/zero" => Ok(VfsNodeKind::DevZero),
         b"/dev/fb0" => Ok(VfsNodeKind::DevFb0),
         b"/dev/input/event0" => Ok(VfsNodeKind::DevInputEvent0),
         b"/bin/init" => Ok(VfsNodeKind::BinInit),
         b"/bin/app" | b"/bin/gui_app" => Ok(VfsNodeKind::BinApp),
+        b"/usr/bin/hello-deb" => Ok(VfsNodeKind::UsrBinHelloDeb),
         _ => Err(LinuxErrno::Enoent),
     }
 }
