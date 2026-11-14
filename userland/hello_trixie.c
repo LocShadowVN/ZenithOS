@@ -23,6 +23,16 @@ typedef unsigned char uint8_t;
 #define O_RDWR              2
 #define FBIOGET_VSCREENINFO 0x4600
 
+// Standard System V AMD64 ABI CRT0 entry point:
+// Aligns RSP to 16 bytes before executing `call c_main`, guaranteeing
+// `RSP % 16 == 8` on function entry so GCC SSE `movaps` instructions never fault.
+__asm__(
+    ".global _start\n"
+    "_start:\n"
+    "    andq $-16, %rsp\n"
+    "    call c_main\n"
+);
+
 static inline int64_t syscall1(uint64_t n, uint64_t a1) {
     int64_t ret;
     __asm__ volatile("syscall" : "=a"(ret) : "a"(n), "D"(a1) : "rcx", "r11", "memory");
@@ -65,10 +75,10 @@ struct linux_utsname {
     char domainname[65];
 };
 
-__attribute__((noreturn)) void _start(void) {
+__attribute__((noreturn, used)) void c_main(void) {
     // 1. Write verification signature "DEB3" to shared VMO address 0x10000600
     volatile uint32_t *sig_ptr = (volatile uint32_t *)0x10000600UL;
-    *sig_ptr = 0x33424544U; // "DEB3" in little-endian
+    *sig_ptr = 0x33424544U;
 
     // 2. Query kernel identity via Linux SYS_uname(63)
     struct linux_utsname uts;
@@ -84,7 +94,10 @@ __attribute__((noreturn)) void _start(void) {
     // 3. Read /etc/debian_version from ZenithFS
     int64_t ver_fd = syscall4(SYS_OPENAT, (uint64_t)AT_FDCWD, (uint64_t)"/etc/debian_version", O_RDONLY, 0);
     if (ver_fd >= 0) {
-        char ver_buf[16] = {0};
+        char ver_buf[16];
+        for (int i = 0; i < 16; i++) {
+            ver_buf[i] = 0;
+        }
         syscall3(SYS_READ, (uint64_t)ver_fd, (uint64_t)ver_buf, 8);
         syscall1(SYS_CLOSE, (uint64_t)ver_fd);
         z_print("[C-APP /usr/bin/hello-deb] ZenithFS /etc/debian_version = ");
@@ -103,7 +116,11 @@ __attribute__((noreturn)) void _start(void) {
     int64_t fb_fd = syscall4(SYS_OPENAT, (uint64_t)AT_FDCWD, (uint64_t)"/dev/fb0", O_RDWR, 0);
     if (fb_fd >= 0) {
         syscall3(SYS_IOCTL, (uint64_t)fb_fd, FBIOGET_VSCREENINFO, 0x10000800UL);
-        uint32_t pixels[4] = {0x00FFFFFFU, 0x0060CDFFU, 0x000078D4U, 0x001F2128U};
+        uint32_t pixels[4];
+        pixels[0] = 0x00FFFFFFU;
+        pixels[1] = 0x0060CDFFU;
+        pixels[2] = 0x000078D4U;
+        pixels[3] = 0x001F2128U;
         syscall3(SYS_WRITE, (uint64_t)fb_fd, (uint64_t)pixels, 16);
         syscall1(SYS_CLOSE, (uint64_t)fb_fd);
     }
