@@ -1,17 +1,14 @@
 #![forbid(unsafe_code)]
 
-/// Magic number for `SYS_statfs` (`f_type`) identifying a mounted ZenithFS volume.
 pub const ZENITHFS_SUPER_MAGIC: u64 = 0x5A45_4E31;
-/// On-disk 64-bit superblock signature `"Z_ZENFS1"`.
 pub const ZFS_DISK_SIGNATURE: u64 = 0x3153_464E_455A_5F5A;
 pub const ZFS_BLOCK_SIZE: usize = 4096;
 pub const ZFS_MAX_INODES: usize = 8;
+pub const ZFS_DATA_SLOT_SIZE: usize = 256;
 pub const MAX_DEB_ELF_SIZE: usize = 16384;
 
-/// Standard Debian `.deb` archive magic header (`ar` format).
 pub const DEB_AR_MAGIC: &[u8; 8] = b"!<arch>\n";
 
-/// Real Debian 13 (`trixie`) `.deb` package built by GCC in CI from `userland/hello_trixie.c`.
 pub static EMBEDDED_GCC_DEB_PACKAGE: &[u8] = include_bytes!("../../userland/hello-trixie.deb");
 
 #[repr(C)]
@@ -32,6 +29,7 @@ pub struct ZenithSuperblock {
 pub struct ZenithInode {
     pub inode_no: u32,
     pub mode: u16,
+    pub system_immutable: bool,
     pub links: u16,
     pub size_bytes: u32,
     pub direct_block: u32,
@@ -45,6 +43,7 @@ impl ZenithInode {
         Self {
             inode_no: 0,
             mode: 0,
+            system_immutable: false,
             links: 0,
             size_bytes: 0,
             direct_block: 0,
@@ -78,6 +77,7 @@ pub struct ZenithFsVolume {
     pub deb_installed: bool,
     pub superblock: ZenithSuperblock,
     pub inodes: [ZenithInode; ZFS_MAX_INODES],
+    pub data_blocks: [[u8; ZFS_DATA_SLOT_SIZE]; ZFS_MAX_INODES],
     pub installed_deb_elf: [u8; MAX_DEB_ELF_SIZE],
     pub installed_deb_len: usize,
 }
@@ -98,23 +98,22 @@ impl ZenithFsVolume {
                 volume_label: *b"ZENITH-TRIXIE\0\0\0",
             },
             inodes: [ZenithInode::empty(); ZFS_MAX_INODES],
+            data_blocks: [[0u8; ZFS_DATA_SLOT_SIZE]; ZFS_MAX_INODES],
             installed_deb_elf: [0u8; MAX_DEB_ELF_SIZE],
             installed_deb_len: 0,
         }
     }
 
     pub fn format_and_mount(&mut self) {
-        self.register_inode(1, 0o100644, 2, b"/etc/debian_version", DEBIAN_VERSION_DATA);
-        self.register_inode(2, 0o100644, 3, b"/etc/apt/sources.list", APT_SOURCES_DATA);
-        self.register_inode(3, 0o100644, 4, b"/var/lib/dpkg/status", DPKG_STATUS_DATA);
-        self.register_inode(4, 0o100444, 5, b"/proc/filesystems", PROC_FILESYSTEMS_DATA);
+        self.register_inode(1, 0o100644, true, b"/etc/debian_version", DEBIAN_VERSION_DATA);
+        self.register_inode(2, 0o100644, true, b"/etc/apt/sources.list", APT_SOURCES_DATA);
+        self.register_inode(3, 0o100644, true, b"/var/lib/dpkg/status", DPKG_STATUS_DATA);
+        self.register_inode(4, 0o100444, true, b"/proc/filesystems", PROC_FILESYSTEMS_DATA);
         self.mounted = self.superblock.signature == ZFS_DISK_SIGNATURE;
 
         let _ = self.install_deb_package(EMBEDDED_GCC_DEB_PACKAGE);
     }
 
-    /// Parses a Debian `.deb` (`!<arch>\n`) archive, verifies `debian-binary` ("2.0\n"),
-    /// and extracts the GCC-compiled `ELF64` binary payload into `/usr/bin/hello-deb`.
     pub fn install_deb_package(&mut self, deb_bytes: &[u8]) -> bool {
         if deb_bytes.len() <= 256 || deb_bytes.get(0..8) != Some(DEB_AR_MAGIC) {
             return false;
@@ -128,7 +127,7 @@ impl ZenithFsVolume {
                 if let Some(dst) = self.installed_deb_elf.get_mut(..payload_len) {
                     dst.copy_from_slice(elf_payload);
                     self.installed_deb_len = payload_len;
-                    self.register_inode(5, 0o100755, 6, b"/usr/bin/hello-deb", elf_payload);
+                    self.register_inode(5, 0o100755, true, b"/usr/bin/hello-deb", b"ELF64_DEB");
                     self.deb_installed = true;
                     return true;
                 }
@@ -137,38 +136,125 @@ impl ZenithFsVolume {
         false
     }
 
+    pub fn find_inode_by_path(&self, path: &[u8]) -> Option<usize> {
+        for (idx, inode) in self.inodes.iter().enumerate() {
+            if inode.inode_no != 0 && inode.path_len == path.len() {
+                if let Some(stored) = inode.path.get(..inode.path_len) {
+                    if stored == path {
+                        return Some(idx);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Creates a new user file inode on ZenithFS (if not already present) and returns its index.
+    pub fn create_user_file(&mut self, path: &[u8], mode: u16) -> Option<usize> {
+        if let Some(existing_idx) = self.find_inode_by_path(path) {
+            return Some(existing_idx);
+        }
+        for idx in 0..ZFS_MAX_INODES {
+            if let Some(slot) = self.inodes.get(idx) {
+                if slot.inode_no == 0 {
+                    let ino = (idx + 1) as u32;
+                    self.register_inode(ino, mode, false, path, &[]);
+                    self.superblock.inode_count += 1;
+                    self.superblock.free_blocks = self.superblock.free_blocks.saturating_sub(1);
+                    return Some(idx);
+                }
+            }
+        }
+        None
+    }
+
+    /// Writes data into a ZenithFS inode's data block and updates its FNV-1a checksum.
+    pub fn write_inode_data(&mut self, idx: usize, offset: usize, src: &[u8]) -> Option<usize> {
+        let inode = self.inodes.get_mut(idx)?;
+        if inode.inode_no == 0 || inode.system_immutable || offset >= ZFS_DATA_SLOT_SIZE {
+            return None;
+        }
+        let block = self.data_blocks.get_mut(idx)?;
+        let avail = ZFS_DATA_SLOT_SIZE - offset;
+        let to_write = src.len().min(avail);
+        if let (Some(dst_slice), Some(src_slice)) =
+            (block.get_mut(offset..offset + to_write), src.get(..to_write))
+        {
+            dst_slice.copy_from_slice(src_slice);
+            let new_end = (offset + to_write) as u32;
+            if new_end > inode.size_bytes {
+                inode.size_bytes = new_end;
+            }
+            if let Some(valid_data) = block.get(..inode.size_bytes as usize) {
+                inode.checksum_fnv1a = compute_fnv1a_checksum(valid_data);
+            }
+            return Some(to_write);
+        }
+        None
+    }
+
+    pub fn read_inode_data(&self, idx: usize, offset: usize, dst: &mut [u8]) -> Option<usize> {
+        let inode = self.inodes.get(idx)?;
+        if inode.inode_no == 0 {
+            return None;
+        }
+        let size = inode.size_bytes as usize;
+        if offset >= size {
+            return Some(0);
+        }
+        let block = self.data_blocks.get(idx)?;
+        let avail = size - offset;
+        let to_read = dst.len().min(avail);
+        if let (Some(src_slice), Some(dst_slice)) =
+            (block.get(offset..offset + to_read), dst.get_mut(..to_read))
+        {
+            dst_slice.copy_from_slice(src_slice);
+            return Some(to_read);
+        }
+        None
+    }
+
     fn register_inode(
         &mut self,
         ino: u32,
         mode: u16,
-        block: u32,
+        system_immutable: bool,
         path_bytes: &[u8],
         content: &[u8],
     ) {
         let idx = (ino as usize).saturating_sub(1);
-        if let Some(slot) = self.inodes.get_mut(idx) {
+        if let (Some(slot), Some(block)) = (self.inodes.get_mut(idx), self.data_blocks.get_mut(idx))
+        {
             let mut path_arr = [0u8; 32];
             let copy_len = path_bytes.len().min(32);
             for (d, &s) in path_arr.iter_mut().take(copy_len).zip(path_bytes.iter()) {
                 *d = s;
             }
+            *block = [0u8; ZFS_DATA_SLOT_SIZE];
+            let data_len = content.len().min(ZFS_DATA_SLOT_SIZE);
+            for (d, &s) in block.iter_mut().take(data_len).zip(content.iter()) {
+                *d = s;
+            }
+            let valid_slice = block.get(..data_len).unwrap_or(&[]);
             *slot = ZenithInode {
                 inode_no: ino,
                 mode,
+                system_immutable,
                 links: 1,
-                size_bytes: content.len() as u32,
-                direct_block: block,
-                checksum_fnv1a: compute_fnv1a_checksum(content),
+                size_bytes: data_len as u32,
+                direct_block: ino + 1,
+                checksum_fnv1a: compute_fnv1a_checksum(valid_slice),
                 path: path_arr,
                 path_len: copy_len,
             };
         }
     }
 
-    pub fn verify_inode_checksum(&self, ino: u32, content: &[u8]) -> bool {
+    pub fn verify_inode_checksum(&self, ino: u32, expected_content: &[u8]) -> bool {
         let idx = (ino as usize).saturating_sub(1);
         if let Some(inode) = self.inodes.get(idx) {
-            inode.inode_no == ino && inode.checksum_fnv1a == compute_fnv1a_checksum(content)
+            inode.inode_no == ino
+                && inode.checksum_fnv1a == compute_fnv1a_checksum(expected_content)
         } else {
             false
         }
