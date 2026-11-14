@@ -57,6 +57,7 @@ struct DescriptorTablePointer {
 pub fn init_gdt_and_tss() {
     // SAFETY:
     // Executed once on the BSP during single-threaded boot initialization.
+    // Also enables SSE/FXSR in CR0 and CR4 so GCC-compiled Ring 3 C binaries can use XMM registers.
     unsafe {
         let rsp0_top = (&raw const KERNEL_INTR_STACK.0 as u64) + 16384;
         let ist1_top = (&raw const DOUBLE_FAULT_IST_STACK.0 as u64) + 16384;
@@ -107,6 +108,17 @@ pub fn init_gdt_and_tss() {
             out("ax") _,
             options(preserves_flags)
         );
+
+        let mut cr0: u64;
+        asm!("mov {}, cr0", out(reg) cr0, options(nostack, preserves_flags));
+        cr0 &= !(1u64 << 2); // Clear CR0.EM
+        cr0 |= 1u64 << 1; // Set CR0.MP
+        asm!("mov cr0, {}", in(reg) cr0, options(nostack, preserves_flags));
+
+        let mut cr4: u64;
+        asm!("mov {}, cr4", out(reg) cr4, options(nostack, preserves_flags));
+        cr4 |= (1u64 << 9) | (1u64 << 10); // Set CR4.OSFXSR & CR4.OSXMMEXCPT
+        asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
     }
 }
 
