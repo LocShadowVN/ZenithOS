@@ -15,7 +15,7 @@ pub use mmu::{
     copy_from_buffer, copy_to_buffer, disable_smap_for_loader, flush_tlb, map_user_page,
     BitmapFrameAllocator, PageFlags, PageTable, PAGE_SIZE,
 };
-pub use pci::{scan_pci_bus, PciDeviceInfo};
+pub use pci::{read_cpu_brand, scan_pci_bus, PciDeviceInfo, RtcDateTime};
 pub use syscall::{
     enter_user_space, init_syscall_msrs, read_msr, return_to_kernel_from_exit, write_msr, Msr,
     PerCpuData, TrapFrame,
