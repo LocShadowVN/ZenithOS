@@ -1,6 +1,7 @@
 pub mod cpu;
 pub mod fb;
 pub mod mmu;
+pub mod pci;
 pub mod syscall;
 
 use core::arch::asm;
@@ -14,6 +15,7 @@ pub use mmu::{
     copy_from_buffer, copy_to_buffer, disable_smap_for_loader, flush_tlb, map_user_page,
     BitmapFrameAllocator, PageFlags, PageTable, PAGE_SIZE,
 };
+pub use pci::{scan_pci_bus, PciDeviceInfo};
 pub use syscall::{
     enter_user_space, init_syscall_msrs, read_msr, return_to_kernel_from_exit, write_msr, Msr,
     PerCpuData, TrapFrame,
@@ -62,7 +64,7 @@ pub fn inb(port: u16) -> u8 {
 #[inline(always)]
 pub fn outl(port: u16, val: u32) {
     // SAFETY:
-    // Writes 32-bit value to the QEMU isa-debug-exit port (0xF4) at CPL=0.
+    // Writes 32-bit value to PCI config space (0xCF8) or QEMU debug exit (0xF4) at CPL=0.
     unsafe {
         asm!(
             "out dx, eax",
@@ -71,6 +73,22 @@ pub fn outl(port: u16, val: u32) {
             options(nostack, preserves_flags)
         );
     }
+}
+
+#[inline(always)]
+pub fn inl(port: u16) -> u32 {
+    let val: u32;
+    // SAFETY:
+    // Reads 32-bit value from PCI config data port (0xCFC) at CPL=0.
+    unsafe {
+        asm!(
+            "in eax, dx",
+            out("eax") val,
+            in("dx") port,
+            options(nostack, preserves_flags)
+        );
+    }
+    val
 }
 
 #[inline]
