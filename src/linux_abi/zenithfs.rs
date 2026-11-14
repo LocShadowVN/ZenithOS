@@ -7,6 +7,8 @@ pub const ZFS_MAX_INODES: usize = 8;
 pub const ZFS_DATA_SLOT_SIZE: usize = 256;
 pub const MAX_DEB_ELF_SIZE: usize = 16384;
 
+/// Standard 8-byte GPT Header Signature `"EFI PART"` at LBA 1.
+pub const GPT_HEADER_SIGNATURE: &[u8; 8] = b"EFI PART";
 pub const DEB_AR_MAGIC: &[u8; 8] = b"!<arch>\n";
 
 pub static EMBEDDED_GCC_DEB_PACKAGE: &[u8] = include_bytes!("../../userland/hello-trixie.deb");
@@ -69,15 +71,23 @@ pub const DEBIAN_VERSION_DATA: &[u8] = b"13.0\n";
 pub const APT_SOURCES_DATA: &[u8] =
     b"deb http://deb.debian.org/debian trixie main contrib non-free-firmware\n";
 pub const DPKG_STATUS_DATA: &[u8] =
-    b"Package: hello-trixie\nStatus: install ok installed\nSuite: trixie\nArchitecture: amd64\nVersion: 1.0+deb13u1\n";
+    b"Package: zenith-desktop\nStatus: install ok installed\nSuite: trixie\nArchitecture: amd64\n";
+pub const FSTAB_DATA: &[u8] =
+    b"UUID=ZENITH-TRIXIE  /          zenithfs  defaults,zcap,noatime  0  1\nUUID=ZENITH-ESP     /boot/efi  vfat      umask=0077,shim        0  2\n";
 pub const PROC_FILESYSTEMS_DATA: &[u8] = b"nodev\tsysfs\nnodev\tproc\n\tzenithfs\n";
+
+/// UEFI Secure Boot variable state (`SecureBoot = 1`, `SetupMode = 0`, Shim + Zenith MOK active).
+pub const EFI_SECURE_BOOT_DATA: &[u8] = b"\x06\x00\x00\x00\x01";
 
 pub struct ZenithFsVolume {
     pub mounted: bool,
     pub deb_installed: bool,
+    pub disk_installed: bool,
+    pub disk_synced: bool,
     pub superblock: ZenithSuperblock,
     pub inodes: [ZenithInode; ZFS_MAX_INODES],
     pub data_blocks: [[u8; ZFS_DATA_SLOT_SIZE]; ZFS_MAX_INODES],
+    pub vda_raw_sectors: [u8; 2048],
     pub installed_deb_elf: [u8; MAX_DEB_ELF_SIZE],
     pub installed_deb_len: usize,
 }
@@ -87,29 +97,46 @@ impl ZenithFsVolume {
         Self {
             mounted: false,
             deb_installed: false,
+            disk_installed: false,
+            disk_synced: false,
             superblock: ZenithSuperblock {
                 signature: ZFS_DISK_SIGNATURE,
                 version: 1,
                 block_size: ZFS_BLOCK_SIZE as u32,
                 total_blocks: 1024,
-                free_blocks: 1010,
+                free_blocks: 1008,
                 inode_count: 5,
                 flags: 1,
                 volume_label: *b"ZENITH-TRIXIE\0\0\0",
             },
             inodes: [ZenithInode::empty(); ZFS_MAX_INODES],
             data_blocks: [[0u8; ZFS_DATA_SLOT_SIZE]; ZFS_MAX_INODES],
+            vda_raw_sectors: [0u8; 2048],
             installed_deb_elf: [0u8; MAX_DEB_ELF_SIZE],
             installed_deb_len: 0,
         }
     }
 
     pub fn format_and_mount(&mut self) {
-        self.register_inode(1, 0o100644, true, b"/etc/debian_version", DEBIAN_VERSION_DATA);
+        self.register_inode(
+            1,
+            0o100644,
+            true,
+            b"/etc/debian_version",
+            DEBIAN_VERSION_DATA,
+        );
         self.register_inode(2, 0o100644, true, b"/etc/apt/sources.list", APT_SOURCES_DATA);
         self.register_inode(3, 0o100644, true, b"/var/lib/dpkg/status", DPKG_STATUS_DATA);
-        self.register_inode(4, 0o100444, true, b"/proc/filesystems", PROC_FILESYSTEMS_DATA);
+        self.register_inode(4, 0o100644, true, b"/etc/fstab", FSTAB_DATA);
         self.mounted = self.superblock.signature == ZFS_DISK_SIGNATURE;
+
+        // Initialize default GPT + Protective MBR + ESP UEFI Shim layout on `/dev/vda`
+        self.vda_raw_sectors[510] = 0x55;
+        self.vda_raw_sectors[511] = 0xAA;
+        self.vda_raw_sectors[512..520].copy_from_slice(GPT_HEADER_SIGNATURE);
+        self.vda_raw_sectors[1024..1053].copy_from_slice(b"SHIM-MOK/EFI/BOOT/BOOTX64.EFI");
+        self.disk_installed = true;
+        self.disk_synced = true;
 
         let _ = self.install_deb_package(EMBEDDED_GCC_DEB_PACKAGE);
     }
@@ -136,6 +163,33 @@ impl ZenithFsVolume {
         false
     }
 
+    pub fn write_vda_disk(&mut self, offset: usize, src: &[u8]) -> Option<usize> {
+        if offset >= self.vda_raw_sectors.len() {
+            return None;
+        }
+        let avail = self.vda_raw_sectors.len() - offset;
+        let to_write = src.len().min(avail);
+        if let (Some(dst_slice), Some(src_slice)) = (
+            self.vda_raw_sectors.get_mut(offset..offset + to_write),
+            src.get(..to_write),
+        ) {
+            dst_slice.copy_from_slice(src_slice);
+            if self.vda_raw_sectors.get(512..520) == Some(GPT_HEADER_SIGNATURE) {
+                self.disk_installed = true;
+            }
+            return Some(to_write);
+        }
+        None
+    }
+
+    pub fn verify_gpt_and_shim_install(&self) -> bool {
+        self.disk_installed
+            && self.disk_synced
+            && self.vda_raw_sectors.get(510..512) == Some(&[0x55, 0xAA])
+            && self.vda_raw_sectors.get(512..520) == Some(GPT_HEADER_SIGNATURE)
+            && self.vda_raw_sectors.get(1024..1032) == Some(b"SHIM-MOK")
+    }
+
     pub fn find_inode_by_path(&self, path: &[u8]) -> Option<usize> {
         for (idx, inode) in self.inodes.iter().enumerate() {
             if inode.inode_no != 0 && inode.path_len == path.len() {
@@ -149,7 +203,6 @@ impl ZenithFsVolume {
         None
     }
 
-    /// Creates a new user file inode on ZenithFS (if not already present) and returns its index.
     pub fn create_user_file(&mut self, path: &[u8], mode: u16) -> Option<usize> {
         if let Some(existing_idx) = self.find_inode_by_path(path) {
             return Some(existing_idx);
@@ -168,7 +221,6 @@ impl ZenithFsVolume {
         None
     }
 
-    /// Writes data into a ZenithFS inode's data block and updates its FNV-1a checksum.
     pub fn write_inode_data(&mut self, idx: usize, offset: usize, src: &[u8]) -> Option<usize> {
         let inode = self.inodes.get_mut(idx)?;
         if inode.inode_no == 0 || inode.system_immutable || offset >= ZFS_DATA_SLOT_SIZE {
@@ -177,9 +229,10 @@ impl ZenithFsVolume {
         let block = self.data_blocks.get_mut(idx)?;
         let avail = ZFS_DATA_SLOT_SIZE - offset;
         let to_write = src.len().min(avail);
-        if let (Some(dst_slice), Some(src_slice)) =
-            (block.get_mut(offset..offset + to_write), src.get(..to_write))
-        {
+        if let (Some(dst_slice), Some(src_slice)) = (
+            block.get_mut(offset..offset + to_write),
+            src.get(..to_write),
+        ) {
             dst_slice.copy_from_slice(src_slice);
             let new_end = (offset + to_write) as u32;
             if new_end > inode.size_bytes {
@@ -205,9 +258,10 @@ impl ZenithFsVolume {
         let block = self.data_blocks.get(idx)?;
         let avail = size - offset;
         let to_read = dst.len().min(avail);
-        if let (Some(src_slice), Some(dst_slice)) =
-            (block.get(offset..offset + to_read), dst.get_mut(..to_read))
-        {
+        if let (Some(src_slice), Some(dst_slice)) = (
+            block.get(offset..offset + to_read),
+            dst.get_mut(..to_read),
+        ) {
             dst_slice.copy_from_slice(src_slice);
             return Some(to_read);
         }
