@@ -13,6 +13,7 @@ typedef unsigned char uint8_t;
 #define SYS_CLOSE           3
 #define SYS_IOCTL           16
 #define SYS_UNAME           63
+#define SYS_GETUID          102
 #define SYS_EXIT_GROUP      231
 #define SYS_OPENAT          257
 #define SYS_EPOLL_PWAIT     281
@@ -20,18 +21,23 @@ typedef unsigned char uint8_t;
 
 #define AT_FDCWD            (-100)
 #define O_RDONLY            0
+#define O_WRONLY            1
 #define O_RDWR              2
+#define O_CREAT             0x40
 #define FBIOGET_VSCREENINFO 0x4600
 
-// Standard System V AMD64 ABI CRT0 entry point:
-// Aligns RSP to 16 bytes before executing `call c_main`, guaranteeing
-// `RSP % 16 == 8` on function entry so GCC SSE `movaps` instructions never fault.
 __asm__(
     ".global _start\n"
     "_start:\n"
     "    andq $-16, %rsp\n"
     "    call c_main\n"
 );
+
+static inline int64_t syscall0(uint64_t n) {
+    int64_t ret;
+    __asm__ volatile("syscall" : "=a"(ret) : "a"(n) : "rcx", "r11", "memory");
+    return ret;
+}
 
 static inline int64_t syscall1(uint64_t n, uint64_t a1) {
     int64_t ret;
@@ -76,32 +82,40 @@ struct linux_utsname {
 };
 
 __attribute__((noreturn, used)) void c_main(void) {
-    // 1. Write verification signature "DEB3" to shared VMO address 0x10000600
     volatile uint32_t *sig_ptr = (volatile uint32_t *)0x10000600UL;
-    *sig_ptr = 0x33424544U;
+    *sig_ptr = 0x33424544U; // "DEB3"
 
-    // 2. Query kernel identity via Linux SYS_uname(63)
-    struct linux_utsname uts;
-    syscall1(SYS_UNAME, (uint64_t)&uts);
-    z_print("[C-APP /usr/bin/hello-deb] GCC ELF64 running on ");
-    z_print(uts.sysname);
-    z_print(" ");
-    z_print(uts.release);
-    z_print(" (");
-    z_print(uts.machine);
-    z_print(")\n");
+    // 1. Verify unprivileged UID=1000 with Z-Cap Passwordless Security
+    int64_t uid = syscall0(SYS_GETUID);
+    if (uid == 1000) {
+        z_print("[C-APP /usr/bin/hello-deb] Running as UID=1000 (Z-Cap Passwordless Mode)\n");
+    }
 
-    // 3. Read /etc/debian_version from ZenithFS
-    int64_t ver_fd = syscall4(SYS_OPENAT, (uint64_t)AT_FDCWD, (uint64_t)"/etc/debian_version", O_RDONLY, 0);
-    if (ver_fd >= 0) {
-        char ver_buf[16];
-        for (int i = 0; i < 16; i++) {
-            ver_buf[i] = 0;
-        }
-        syscall3(SYS_READ, (uint64_t)ver_fd, (uint64_t)ver_buf, 8);
-        syscall1(SYS_CLOSE, (uint64_t)ver_fd);
-        z_print("[C-APP /usr/bin/hello-deb] ZenithFS /etc/debian_version = ");
-        z_print(ver_buf);
+    // 2. Create and write a new file `/home/user/zenith.txt` on ZenithFS without sudo
+    int64_t note_fd = syscall4(
+        SYS_OPENAT,
+        (uint64_t)AT_FDCWD,
+        (uint64_t)"/home/user/zenith.txt",
+        O_CREAT | O_RDWR,
+        0644
+    );
+    if (note_fd >= 0) {
+        const char *payload = "ZFS1_USER_FILE_OK";
+        syscall3(SYS_WRITE, (uint64_t)note_fd, (uint64_t)payload, 17);
+        syscall1(SYS_CLOSE, (uint64_t)note_fd);
+        z_print("[C-APP /usr/bin/hello-deb] Created /home/user/zenith.txt on ZenithFS.\n");
+    }
+
+    // 3. Attempt unauthorized write to immutable system file `/etc/debian_version`
+    int64_t hack_fd = syscall4(
+        SYS_OPENAT,
+        (uint64_t)AT_FDCWD,
+        (uint64_t)"/etc/debian_version",
+        O_WRONLY,
+        0
+    );
+    if (hack_fd == -13) { // -EACCES (Permission Denied)
+        z_print("[Z-CAP GUARD] Blocked unauthorized write to /etc/debian_version (-EACCES)!\n");
     }
 
     // 4. Poll and read Linux evdev (/dev/input/event0)
@@ -125,7 +139,6 @@ __attribute__((noreturn, used)) void c_main(void) {
         syscall1(SYS_CLOSE, (uint64_t)fb_fd);
     }
 
-    // 6. Terminate cleanly with exit code 0x66
     syscall1(SYS_EXIT_GROUP, 0x66);
     __builtin_unreachable();
 }
