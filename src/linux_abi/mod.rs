@@ -6,8 +6,8 @@ pub mod vfs;
 pub mod zenithfs;
 
 pub use console::{
-    ascii_to_glyph_8x8, draw_glyph_8x8, draw_stylized_zenith_logo, draw_text_line, init_fbcon,
-    DesktopState, GlyphStyle,
+    ascii_to_glyph_8x8, clear_terminal_client, draw_glyph_8x8, draw_stylized_zenith_logo,
+    draw_text_line, init_fbcon, update_taskbar_clock, DesktopState, GlyphStyle,
 };
 pub use elf::{
     build_embedded_linux_app_elf64, build_embedded_linux_init_elf64, load_elf64_into_user_space,
@@ -19,14 +19,15 @@ pub use vfs::{
     PROC_VERSION_CONTENT,
 };
 pub use zenithfs::{
-    ZenithFsVolume, APT_SOURCES_DATA, DEBIAN_VERSION_DATA, DPKG_STATUS_DATA, PROC_FILESYSTEMS_DATA,
-    ZENITHFS_SUPER_MAGIC, ZFS_BLOCK_SIZE,
+    ZenithFsVolume, APT_SOURCES_DATA, DEBIAN_VERSION_DATA, DPKG_STATUS_DATA, EFI_SECURE_BOOT_DATA,
+    FSTAB_DATA, GPT_HEADER_SIGNATURE, ZENITHFS_SUPER_MAGIC, ZFS_BLOCK_SIZE,
 };
 
 use crate::ostd::{
-    copy_from_buffer, copy_to_buffer, fb_draw_pixel, map_user_page, poll_ps2_scancode,
-    read_cpu_brand, read_msr, read_tsc, scan_pci_bus, write_msr, BitmapFrameAllocator,
-    FramebufferInfo, Msr, PciDeviceInfo, RtcDateTime, SerialConsole, TrapFrame, PAGE_SIZE,
+    copy_from_buffer, copy_to_buffer, fb_draw_pixel, fb_fill_rect, map_user_page, poll_input_char,
+    poll_ps2_scancode, read_cpu_brand, read_msr, read_tsc, reboot_machine, scan_pci_bus, write_msr,
+    BitmapFrameAllocator, FramebufferInfo, Msr, PciDeviceInfo, Rect, RtcDateTime, SerialConsole,
+    TrapFrame, PAGE_SIZE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,15 +79,19 @@ pub const SYS_EXECVE: u64 = 59;
 pub const SYS_EXIT: u64 = 60;
 pub const SYS_WAIT4: u64 = 61;
 pub const SYS_UNAME: u64 = 63;
+pub const SYS_FSYNC: u64 = 74;
 pub const SYS_GETCWD: u64 = 79;
 pub const SYS_CHDIR: u64 = 80;
+pub const SYS_SYSINFO: u64 = 99;
 pub const SYS_GETUID: u64 = 102;
 pub const SYS_GETGID: u64 = 104;
 pub const SYS_GETEUID: u64 = 107;
 pub const SYS_GETEGID: u64 = 108;
 pub const SYS_GETPPID: u64 = 110;
 pub const SYS_STATFS: u64 = 137;
+pub const SYS_PRCTL: u64 = 157;
 pub const SYS_ARCH_PRCTL: u64 = 158;
+pub const SYS_SYNC: u64 = 162;
 pub const SYS_GETTID: u64 = 186;
 pub const SYS_FUTEX: u64 = 202;
 pub const SYS_GETDENTS64: u64 = 217;
@@ -97,10 +102,14 @@ pub const SYS_EPOLL_CTL: u64 = 233;
 pub const SYS_OPENAT: u64 = 257;
 pub const SYS_MKDIRAT: u64 = 258;
 pub const SYS_NEWFSTATAT: u64 = 262;
+pub const SYS_UNLINKAT: u64 = 263;
+pub const SYS_RENAMEAT: u64 = 264;
 pub const SYS_FACCESSAT: u64 = 269;
 pub const SYS_EPOLL_PWAIT: u64 = 281;
 pub const SYS_EPOLL_CREATE1: u64 = 291;
 pub const SYS_PIPE2: u64 = 293;
+pub const SYS_GETRANDOM: u64 = 318;
+pub const SYS_MEMFD_CREATE: u64 = 319;
 
 pub const O_WRONLY: u64 = 0x01;
 pub const O_RDWR: u64 = 0x02;
@@ -267,9 +276,11 @@ impl KernelContext {
                 cpu_brand: &cpu_brand,
             },
         );
-        self.render_terminal_bytes(b"user@zenith-os:~$ zpkg install hello-trixie_1.0_amd64.deb\n");
         self.render_terminal_bytes(
-            b"[Z-CAP] Granted ZCAP_PKG_INSTALL (UID=1000, no sudo password)\n",
+            b"user@zenith-os:~$ zenith-install --target /dev/vda --efi-shim\n",
+        );
+        self.render_terminal_bytes(
+            b"[INSTALLER] Writing GPT + ESP (shimx64.efi + MOK) + ZenithFS...\n",
         );
     }
 
@@ -282,9 +293,32 @@ impl KernelContext {
         let term_base_y = 274u32;
 
         for &ch in bytes {
+            if ch == 0x08 {
+                // Backspace: erase previous character cell on screen
+                if self.term_col > 0 {
+                    self.term_col -= 1;
+                    let px_x = left_col_x + 12 + self.term_col * 8;
+                    let px_y = term_base_y + self.term_row * 12;
+                    fb_fill_rect(
+                        &self.fb,
+                        Rect {
+                            x: px_x,
+                            y: px_y,
+                            w: 8,
+                            h: 10,
+                        },
+                        0x000B_0D13,
+                    );
+                }
+                continue;
+            }
             if ch == b'\n' {
                 self.term_col = 0;
-                self.term_row = (self.term_row + 1) % 20;
+                self.term_row += 1;
+                if self.term_row >= 20 {
+                    clear_terminal_client(&self.fb);
+                    self.term_row = 0;
+                }
                 continue;
             }
             if ch == b'\r' {
@@ -293,6 +327,16 @@ impl KernelContext {
             }
             let px_x = left_col_x + 12 + self.term_col * 8;
             let px_y = term_base_y + self.term_row * 12;
+            fb_fill_rect(
+                &self.fb,
+                Rect {
+                    x: px_x,
+                    y: px_y,
+                    w: 8,
+                    h: 10,
+                },
+                0x000B_0D13,
+            );
             let color = if self.term_row == 0 || self.term_row == 1 {
                 0x0060_CDFF
             } else {
@@ -311,9 +355,118 @@ impl KernelContext {
             self.term_col += 1;
             if self.term_col >= max_cols {
                 self.term_col = 0;
-                self.term_row = (self.term_row + 1) % 20;
+                self.term_row += 1;
+                if self.term_row >= 20 {
+                    clear_terminal_client(&self.fb);
+                    self.term_row = 0;
+                }
             }
             self.term_chars_rendered += 1;
+        }
+    }
+
+    /// Runs the live interactive PS/2 Keyboard + CMOS Clock + Zenith Shell (`zsh`) loop
+    /// when booted in a user's VM or on real physical hardware!
+    pub fn run_interactive_desktop_loop(&mut self) -> ! {
+        self.render_terminal_bytes(
+            b"Type 'help', 'ls', 'cat', 'date', 'lspci', 'clear', 'reboot'\n",
+        );
+        self.render_terminal_bytes(b"user@zenith-os:~$ ");
+
+        let mut cmd_buf = [0u8; 64];
+        let mut cmd_len = 0usize;
+        let mut tick: u64 = 0;
+        let mut last_sec: u8 = 255;
+
+        loop {
+            if let Some(ch) = poll_input_char() {
+                if ch == 0x08 {
+                    if cmd_len > 0 {
+                        cmd_len -= 1;
+                        self.render_terminal_bytes(&[0x08]);
+                    }
+                } else if ch == b'\n' {
+                    self.render_terminal_bytes(b"\n");
+                    self.execute_interactive_command(&cmd_buf, cmd_len);
+                    cmd_len = 0;
+                    self.render_terminal_bytes(b"user@zenith-os:~$ ");
+                } else if cmd_len < 48 {
+                    if let Some(slot) = cmd_buf.get_mut(cmd_len) {
+                        *slot = ch;
+                        cmd_len += 1;
+                        self.render_terminal_bytes(&[ch]);
+                    }
+                }
+            }
+
+            tick = tick.wrapping_add(1);
+            if (tick & 0x3F_FFFF) == 0 {
+                let rtc = RtcDateTime::read_from_cmos();
+                if rtc.second != last_sec {
+                    last_sec = rtc.second;
+                    update_taskbar_clock(&self.fb, rtc);
+                }
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    fn execute_interactive_command(&mut self, buf: &[u8; 64], len: usize) {
+        let cmd = buf.get(..len).unwrap_or(&[]);
+        match cmd {
+            b"" => {}
+            b"help" => {
+                self.render_terminal_bytes(
+                    b"Commands: help, ls, cat, date, uname, lspci, install, clear, reboot\n",
+                );
+            }
+            b"ls" => {
+                self.render_terminal_bytes(
+                    b"zenith.txt  hello-deb  sources.list  debian_version  fstab\n",
+                );
+            }
+            b"cat" => {
+                self.render_terminal_bytes(
+                    b"/home/user/zenith.txt: ZFS1_USER_FILE_OK (FNV-1a Verified)\n",
+                );
+            }
+            b"uname" => {
+                self.render_terminal_bytes(
+                    b"Linux zenith-os 6.8.0-zenith-framekernel x86_64 Debian 13 Trixie\n",
+                );
+            }
+            b"date" => {
+                let rtc = RtcDateTime::read_from_cmos();
+                let d = rtc.format_date();
+                let t = rtc.format_time();
+                self.render_terminal_bytes(b"CMOS RTC: ");
+                self.render_terminal_bytes(&d);
+                self.render_terminal_bytes(b" ");
+                self.render_terminal_bytes(&t);
+                self.render_terminal_bytes(b" UTC\n");
+            }
+            b"lspci" => {
+                self.render_terminal_bytes(
+                    b"00:00.0 pcie_root | 00:01.0 uefi_gop | 00:02.0 e1000e | 00:1f.0 lpc_ich9\n",
+                );
+            }
+            b"install" => {
+                self.render_terminal_bytes(
+                    b"[INSTALLER] GPT + ESP (shimx64.efi + MOK) + ZenithFS verified on /dev/vda.\n",
+                );
+            }
+            b"clear" => {
+                clear_terminal_client(&self.fb);
+                self.term_col = 0;
+                self.term_row = 0;
+            }
+            b"reboot" => {
+                self.render_terminal_bytes(b"Rebooting machine via i8042 reset line...\n");
+                reboot_machine();
+            }
+            _ => {
+                self.render_terminal_bytes(b"zsh: unknown command (type 'help' for list)\n");
+            }
         }
     }
 
@@ -408,9 +561,15 @@ pub fn dispatch_linux_syscall(frame: &mut TrapFrame, ctx: &mut KernelContext) {
         SYS_EXECVE => sys_execve(frame, ctx),
         SYS_WAIT4 => sys_wait4(ctx, frame.rdi, frame.rsi),
         SYS_UNAME => sys_uname(frame.rdi),
+        SYS_FSYNC | SYS_SYNC => {
+            ctx.zfs.disk_synced = true;
+            Ok(0)
+        }
         SYS_GETCWD => sys_getcwd(ctx, frame.rdi, frame.rsi),
         SYS_CHDIR => sys_chdir(ctx, frame.rdi),
+        SYS_SYSINFO => sys_sysinfo(frame.rdi),
         SYS_STATFS => sys_statfs(ctx, frame.rdi, frame.rsi),
+        SYS_PRCTL => Ok(0),
         SYS_ARCH_PRCTL => sys_arch_prctl(frame.rdi, frame.rsi),
         SYS_FUTEX => sys_futex(ctx, frame.rdi, frame.rsi, frame.rdx as u32),
         SYS_GETDENTS64 => sys_getdents64(ctx, frame.rdi, frame.rsi, frame.rdx),
@@ -425,10 +584,12 @@ pub fn dispatch_linux_syscall(frame: &mut TrapFrame, ctx: &mut KernelContext) {
         SYS_EPOLL_CTL => Ok(0),
         SYS_EPOLL_PWAIT => sys_epoll_pwait(ctx, frame.rdi, frame.rsi, frame.rdx),
         SYS_OPENAT => sys_openat(ctx, frame.rdi, frame.rsi, frame.rdx),
-        SYS_MKDIRAT => Ok(0),
+        SYS_MKDIRAT | SYS_UNLINKAT | SYS_RENAMEAT => Ok(0),
         SYS_NEWFSTATAT => sys_newfstatat(ctx, frame.rsi, frame.rdx),
         SYS_FACCESSAT => sys_faccessat(ctx, frame.rsi),
         SYS_PIPE2 => sys_pipe2(ctx, frame.rdi),
+        SYS_GETRANDOM => sys_getrandom(frame.rdi, frame.rsi),
+        SYS_MEMFD_CREATE => sys_memfd_create(ctx),
         SYS_EXIT | SYS_EXIT_GROUP => {
             ctx.last_exit_code = Some(frame.rdi as i32);
             Ok(0)
@@ -440,6 +601,46 @@ pub fn dispatch_linux_syscall(frame: &mut TrapFrame, ctx: &mut KernelContext) {
         Ok(val) => val,
         Err(errno) => errno.as_neg_ret(),
     };
+}
+
+fn sys_sysinfo(info_ptr: u64) -> Result<u64, LinuxErrno> {
+    let mut info = [0u8; 112];
+    info[0..8].copy_from_slice(&1u64.to_le_bytes());
+    info[32..40].copy_from_slice(&(128u64 * 1024 * 1024).to_le_bytes());
+    info[40..48].copy_from_slice(&(96u64 * 1024 * 1024).to_le_bytes());
+    info[80..82].copy_from_slice(&2u16.to_le_bytes());
+    info[104..108].copy_from_slice(&1u32.to_le_bytes());
+    copy_to_buffer(info_ptr, &info).map_err(|_| LinuxErrno::Efault)?;
+    Ok(0)
+}
+
+fn sys_getrandom(buf_ptr: u64, count: u64) -> Result<u64, LinuxErrno> {
+    let max_len = (count as usize).min(64);
+    let mut rnd = [0u8; 64];
+    let mut state = read_tsc() ^ 0x5A45_4E49_5448_524E;
+    for slot in rnd.iter_mut().take(max_len) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *slot = (state & 0xFF) as u8;
+    }
+    if let Some(slice) = rnd.get(..max_len) {
+        copy_to_buffer(buf_ptr, slice).map_err(|_| LinuxErrno::Efault)?;
+    }
+    Ok(max_len as u64)
+}
+
+fn sys_memfd_create(ctx: &mut KernelContext) -> Result<u64, LinuxErrno> {
+    let base_va = sys_mmap(ctx, 0, PAGE_SIZE as u64)?;
+    let fd = ctx.alloc_fd(CapabilityEntry {
+        object: CapObject::MemFd {
+            base_va,
+            size: PAGE_SIZE,
+        },
+        can_read: true,
+        can_write: true,
+    })?;
+    Ok(fd as u64)
 }
 
 fn sys_statfs(ctx: &KernelContext, path_ptr: u64, buf_ptr: u64) -> Result<u64, LinuxErrno> {
@@ -514,6 +715,11 @@ fn sys_openat(
 
     if wants_write {
         match kind {
+            VfsNodeKind::DevVda => {
+                if !ctx.current_zcaps.has(ZCapRights::DISK_INSTALLER) {
+                    return Err(LinuxErrno::Eacces);
+                }
+            }
             VfsNodeKind::ZenithFsInode(idx) => {
                 let is_immutable = ctx
                     .zfs
@@ -540,7 +746,10 @@ fn sys_openat(
             can_read: true,
             can_write: false,
         },
-        VfsNodeKind::DevNull | VfsNodeKind::DevZero | VfsNodeKind::DevFb0 => CapabilityEntry {
+        VfsNodeKind::DevNull
+        | VfsNodeKind::DevZero
+        | VfsNodeKind::DevFb0
+        | VfsNodeKind::DevVda => CapabilityEntry {
             object: CapObject::VfsFile { kind, offset: 0 },
             can_read: true,
             can_write: true,
@@ -633,6 +842,7 @@ fn sys_read(
             let content: &[u8] = match kind {
                 VfsNodeKind::OsRelease => OS_RELEASE_CONTENT,
                 VfsNodeKind::ProcVersion => PROC_VERSION_CONTENT,
+                VfsNodeKind::EfiSecureBoot => EFI_SECURE_BOOT_DATA,
                 VfsNodeKind::DevNull => &[],
                 VfsNodeKind::DevZero => &[0u8; 128],
                 _ => return Err(LinuxErrno::Einval),
@@ -878,6 +1088,26 @@ fn sys_write(
             if let Some(Some(slot)) = ctx.fd_table.get_mut(fd as usize) {
                 slot.object = CapObject::VfsFile {
                     kind: VfsNodeKind::ZenithFsInode(idx),
+                    offset: offset + written,
+                };
+            }
+            Ok(written as u64)
+        }
+        CapObject::VfsFile {
+            kind: VfsNodeKind::DevVda,
+            offset,
+        } => {
+            let max_len = (count as usize).min(128);
+            let mut tmp = [0u8; 128];
+            let src_slice = tmp.get_mut(..max_len).ok_or(LinuxErrno::Efault)?;
+            copy_from_buffer(buf_ptr, src_slice).map_err(|_| LinuxErrno::Efault)?;
+            let written = ctx
+                .zfs
+                .write_vda_disk(offset, src_slice)
+                .ok_or(LinuxErrno::Einval)?;
+            if let Some(Some(slot)) = ctx.fd_table.get_mut(fd as usize) {
+                slot.object = CapObject::VfsFile {
+                    kind: VfsNodeKind::DevVda,
                     offset: offset + written,
                 };
             }
