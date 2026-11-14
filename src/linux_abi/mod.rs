@@ -660,20 +660,30 @@ fn sys_execve(frame: &mut TrapFrame, ctx: &mut KernelContext) -> Result<u64, Lin
     let path_slice = read_cstr_from_user(frame.rdi, &mut path_buf)?;
     let kind = resolve_vfs_path(path_slice)?;
 
-    let elf_image = match kind {
+    let fallback_elf;
+    let elf_slice: &[u8] = match kind {
         VfsNodeKind::UsrBinHelloDeb => {
-            if !ctx.zfs.deb_installed {
+            if !ctx.zfs.deb_installed || ctx.zfs.installed_deb_len == 0 {
                 return Err(LinuxErrno::Enoent);
             }
-            ctx.zfs.installed_deb_elf
+            ctx.zfs
+                .installed_deb_elf
+                .get(..ctx.zfs.installed_deb_len)
+                .ok_or(LinuxErrno::Efault)?
         }
-        VfsNodeKind::BinApp => build_embedded_linux_app_elf64(),
-        VfsNodeKind::BinInit => build_embedded_linux_init_elf64(),
+        VfsNodeKind::BinApp => {
+            fallback_elf = build_embedded_linux_app_elf64();
+            &fallback_elf
+        }
+        VfsNodeKind::BinInit => {
+            fallback_elf = build_embedded_linux_init_elf64();
+            &fallback_elf
+        }
         _ => return Err(LinuxErrno::Eacces),
     };
 
     let loaded =
-        load_elf64_into_user_space(&elf_image, &mut ctx.pmm).map_err(|_| LinuxErrno::Enomem)?;
+        load_elf64_into_user_space(elf_slice, &mut ctx.pmm).map_err(|_| LinuxErrno::Enomem)?;
 
     ctx.program_break = loaded.initial_brk;
 
