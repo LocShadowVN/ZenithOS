@@ -3,15 +3,36 @@
 use crate::linux_abi::LinuxErrno;
 use crate::ostd::copy_from_buffer;
 
+/// ZenithOS Passwordless Capability Security Bitmask (`Z-Cap`).
+/// Replaces traditional Linux `sudo` password prompts with scoped per-process capabilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZCapRights(pub u64);
+
+impl ZCapRights {
+    /// Allows reading and writing files inside `/home` and `/tmp` without elevation.
+    pub const FS_USER_HOME: u64 = 1 << 0;
+    /// Allows installing verified `.deb` packages into `/usr/bin` without `sudo`.
+    pub const PKG_INSTALL: u64 = 1 << 1;
+    /// Allows accessing `/dev/fb0` and `/dev/input/event0` for desktop UI applications.
+    pub const DEV_DESKTOP_UI: u64 = 1 << 2;
+    /// Allows modifying immutable system files (`/etc`, `/boot`). Disabled for normal apps!
+    pub const SYS_ADMIN_IMMUTABLE: u64 = 1 << 3;
+
+    pub const DEFAULT_DESKTOP_USER: Self =
+        Self(Self::FS_USER_HOME | Self::PKG_INSTALL | Self::DEV_DESKTOP_UI);
+
+    #[inline]
+    pub const fn has(self, flag: u64) -> bool {
+        (self.0 & flag) != 0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsNodeKind {
     RootDir,
     OsRelease,
     ProcVersion,
-    ProcFilesystems,
-    DebianVersion,
-    AptSourcesList,
-    DpkgStatus,
+    ZenithFsInode(usize),
     DevNull,
     DevZero,
     DevFb0,
@@ -125,19 +146,19 @@ impl PipeRingBuffer {
 }
 
 pub const OS_RELEASE_CONTENT: &[u8] =
-    b"NAME=\"ZenithOS\"\nVERSION=\"0.8.0 (Trixie)\"\nID=zenith\nID_LIKE=debian\nPRETTY_NAME=\"ZenithOS 0.8.0 (Debian 13 Trixie amd64)\"\n";
+    b"NAME=\"ZenithOS\"\nVERSION=\"1.1.0 (Trixie)\"\nID=zenith\nID_LIKE=debian\nPRETTY_NAME=\"ZenithOS 1.1.0 (Debian 13 Trixie amd64)\"\n";
 pub const PROC_VERSION_CONTENT: &[u8] =
     b"Linux version 6.8.0-zenith-framekernel (rust@zenith) #1 SMP PREEMPT_DYNAMIC\n";
 
 pub fn resolve_vfs_path(path: &[u8]) -> Result<VfsNodeKind, LinuxErrno> {
     match path {
-        b"/" | b"." => Ok(VfsNodeKind::RootDir),
+        b"/" | b"." | b"/home" | b"/home/user" => Ok(VfsNodeKind::RootDir),
         b"/etc/os-release" | b"etc/os-release" => Ok(VfsNodeKind::OsRelease),
-        b"/etc/debian_version" | b"etc/debian_version" => Ok(VfsNodeKind::DebianVersion),
-        b"/etc/apt/sources.list" => Ok(VfsNodeKind::AptSourcesList),
-        b"/var/lib/dpkg/status" => Ok(VfsNodeKind::DpkgStatus),
+        b"/etc/debian_version" | b"etc/debian_version" => Ok(VfsNodeKind::ZenithFsInode(0)),
+        b"/etc/apt/sources.list" => Ok(VfsNodeKind::ZenithFsInode(1)),
+        b"/var/lib/dpkg/status" => Ok(VfsNodeKind::ZenithFsInode(2)),
+        b"/proc/filesystems" => Ok(VfsNodeKind::ZenithFsInode(3)),
         b"/proc/version" | b"proc/version" => Ok(VfsNodeKind::ProcVersion),
-        b"/proc/filesystems" => Ok(VfsNodeKind::ProcFilesystems),
         b"/dev/null" => Ok(VfsNodeKind::DevNull),
         b"/dev/zero" => Ok(VfsNodeKind::DevZero),
         b"/dev/fb0" => Ok(VfsNodeKind::DevFb0),
@@ -149,12 +170,18 @@ pub fn resolve_vfs_path(path: &[u8]) -> Result<VfsNodeKind, LinuxErrno> {
     }
 }
 
+/// Reads a null-terminated C string byte-by-byte from user space without crossing unmapped page boundaries.
 pub fn read_cstr_from_user(user_ptr: u64, buf: &mut [u8; 64]) -> Result<&[u8], LinuxErrno> {
-    copy_from_buffer(user_ptr, buf).map_err(|_| LinuxErrno::Efault)?;
     let mut len = 0;
     while len < buf.len() {
-        if buf.get(len) == Some(&0) {
+        let mut byte = [0u8; 1];
+        copy_from_buffer(user_ptr.wrapping_add(len as u64), &mut byte)
+            .map_err(|_| LinuxErrno::Efault)?;
+        if byte[0] == 0 {
             break;
+        }
+        if let Some(slot) = buf.get_mut(len) {
+            *slot = byte[0];
         }
         len += 1;
     }
