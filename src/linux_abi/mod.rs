@@ -15,7 +15,7 @@ pub use elf::{
 };
 pub use vfs::{
     read_cstr_from_user, resolve_vfs_path, CapObject, CapabilityEntry, LinuxInputEvent,
-    PipeRingBuffer, VfsNodeKind, MAX_FDS, MAX_PIPES, OS_RELEASE_CONTENT, PIPE_BUF_SIZE,
+    PipeRingBuffer, VfsNodeKind, ZCapRights, MAX_FDS, MAX_PIPES, OS_RELEASE_CONTENT, PIPE_BUF_SIZE,
     PROC_VERSION_CONTENT,
 };
 pub use zenithfs::{
@@ -80,6 +80,10 @@ pub const SYS_WAIT4: u64 = 61;
 pub const SYS_UNAME: u64 = 63;
 pub const SYS_GETCWD: u64 = 79;
 pub const SYS_CHDIR: u64 = 80;
+pub const SYS_GETUID: u64 = 102;
+pub const SYS_GETGID: u64 = 104;
+pub const SYS_GETEUID: u64 = 107;
+pub const SYS_GETEGID: u64 = 108;
 pub const SYS_GETPPID: u64 = 110;
 pub const SYS_STATFS: u64 = 137;
 pub const SYS_ARCH_PRCTL: u64 = 158;
@@ -91,11 +95,16 @@ pub const SYS_CLOCK_GETTIME: u64 = 228;
 pub const SYS_EXIT_GROUP: u64 = 231;
 pub const SYS_EPOLL_CTL: u64 = 233;
 pub const SYS_OPENAT: u64 = 257;
+pub const SYS_MKDIRAT: u64 = 258;
 pub const SYS_NEWFSTATAT: u64 = 262;
 pub const SYS_FACCESSAT: u64 = 269;
 pub const SYS_EPOLL_PWAIT: u64 = 281;
 pub const SYS_EPOLL_CREATE1: u64 = 291;
 pub const SYS_PIPE2: u64 = 293;
+
+pub const O_WRONLY: u64 = 0x01;
+pub const O_RDWR: u64 = 0x02;
+pub const O_CREAT: u64 = 0x40;
 
 pub const ARCH_SET_GS: u64 = 0x1001;
 pub const ARCH_SET_FS: u64 = 0x1002;
@@ -126,6 +135,9 @@ pub enum TaskState {
 pub struct TaskControlBlock {
     pub pid: u64,
     pub ppid: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub zcaps: ZCapRights,
     pub state: TaskState,
     pub clear_child_tid: u64,
 }
@@ -135,6 +147,9 @@ impl TaskControlBlock {
         Self {
             pid: 0,
             ppid: 0,
+            uid: 1000,
+            gid: 1000,
+            zcaps: ZCapRights::DEFAULT_DESKTOP_USER,
             state: TaskState::Unused,
             clear_child_tid: 0,
         }
@@ -155,7 +170,10 @@ pub struct KernelContext {
     pub term_row: u32,
     pub term_chars_rendered: u64,
     pub evdev_events_read: u64,
+    pub zcap_blocks_count: u64,
     pub current_pid: u64,
+    pub current_uid: u32,
+    pub current_zcaps: ZCapRights,
     pub next_pid: u64,
     pub program_break: u64,
     pub next_mmap_va: u64,
@@ -190,6 +208,9 @@ impl KernelContext {
         tasks[0] = TaskControlBlock {
             pid: 1,
             ppid: 0,
+            uid: 1000,
+            gid: 1000,
+            zcaps: ZCapRights::DEFAULT_DESKTOP_USER,
             state: TaskState::Running,
             clear_child_tid: 0,
         };
@@ -209,7 +230,10 @@ impl KernelContext {
             term_row: 0,
             term_chars_rendered: 0,
             evdev_events_read: 0,
+            zcap_blocks_count: 0,
             current_pid: 1,
+            current_uid: 1000,
+            current_zcaps: ZCapRights::DEFAULT_DESKTOP_USER,
             next_pid: 2,
             program_break: 0x0000_0000_0040_3000,
             next_mmap_va: 0x0000_0000_1000_0000,
@@ -233,10 +257,10 @@ impl KernelContext {
         self.zfs.format_and_mount();
         self.fb = FramebufferInfo::detect_from_limine();
         init_fbcon(&self.fb, &self.pci_devices, self.pci_count);
-        self.render_terminal_bytes(b"root@zenith-os:~# mount -t zenithfs /dev/vda1 /\n");
-        self.render_terminal_bytes(b"[ZENITH-FS] Mounted ZFS1 volume 'ZENITH-TRIXIE' (Debian 13.0)\n");
-        self.render_terminal_bytes(b"root@zenith-os:~# dpkg -i hello-trixie_1.0_amd64.deb\n");
-        self.render_terminal_bytes(b"Unpacking GCC ELF64 binary to /usr/bin/hello-deb...\n");
+        self.render_terminal_bytes(b"user@zenith-os:~$ zpkg install hello-trixie_1.0_amd64.deb\n");
+        self.render_terminal_bytes(
+            b"[Z-CAP] Granted ZCAP_PKG_INSTALL (UID=1000, no sudo password required)\n",
+        );
     }
 
     pub fn render_terminal_bytes(&mut self, bytes: &[u8]) {
@@ -254,7 +278,7 @@ impl KernelContext {
             }
             let px_x = 38 + self.term_col * 8;
             let px_y = 72 + self.term_row * 12;
-            let color = if self.term_row == 0 || self.term_row == 2 {
+            let color = if self.term_row == 0 || self.term_row == 1 {
                 0x0060_CDFF
             } else {
                 0x00E5_E7EB
@@ -363,6 +387,7 @@ pub fn dispatch_linux_syscall(frame: &mut TrapFrame, ctx: &mut KernelContext) {
         SYS_DUP => sys_dup(ctx, frame.rdi),
         SYS_DUP2 => sys_dup2(ctx, frame.rdi, frame.rsi),
         SYS_GETPID | SYS_GETTID => Ok(ctx.current_pid),
+        SYS_GETUID | SYS_GETEUID | SYS_GETGID | SYS_GETEGID => Ok(ctx.current_uid as u64),
         SYS_GETPPID => Ok(0),
         SYS_CLONE => sys_clone(ctx),
         SYS_EXECVE => sys_execve(frame, ctx),
@@ -385,8 +410,9 @@ pub fn dispatch_linux_syscall(frame: &mut TrapFrame, ctx: &mut KernelContext) {
         SYS_EPOLL_CTL => Ok(0),
         SYS_EPOLL_PWAIT => sys_epoll_pwait(ctx, frame.rdi, frame.rsi, frame.rdx),
         SYS_OPENAT => sys_openat(ctx, frame.rdi, frame.rsi, frame.rdx),
-        SYS_NEWFSTATAT => sys_newfstatat(frame.rsi, frame.rdx),
-        SYS_FACCESSAT => sys_faccessat(frame.rsi),
+        SYS_MKDIRAT => Ok(0),
+        SYS_NEWFSTATAT => sys_newfstatat(ctx, frame.rsi, frame.rdx),
+        SYS_FACCESSAT => sys_faccessat(ctx, frame.rsi),
         SYS_PIPE2 => sys_pipe2(ctx, frame.rdi),
         SYS_EXIT | SYS_EXIT_GROUP => {
             ctx.last_exit_code = Some(frame.rdi as i32);
@@ -449,11 +475,53 @@ fn sys_openat(
     ctx: &mut KernelContext,
     _dirfd: u64,
     path_ptr: u64,
-    _flags: u64,
+    flags: u64,
 ) -> Result<u64, LinuxErrno> {
     let mut path_buf = [0u8; 64];
     let path_slice = read_cstr_from_user(path_ptr, &mut path_buf)?;
-    let kind = resolve_vfs_path(path_slice)?;
+    let wants_write = (flags & (O_WRONLY | O_RDWR)) != 0;
+    let wants_creat = (flags & O_CREAT) != 0;
+
+    // 1. Check if the path already exists in ZenithFS dynamic inodes or VFS
+    let kind = if let Some(idx) = ctx.zfs.find_inode_by_path(path_slice) {
+        VfsNodeKind::ZenithFsInode(idx)
+    } else if wants_creat && path_slice.starts_with(b"/home/") {
+        // Z-Cap Check: Normal user (UID=1000) can create files in `/home/` without sudo if `FS_USER_HOME` is held!
+        if !ctx.current_zcaps.has(ZCapRights::FS_USER_HOME) {
+            return Err(LinuxErrno::Eacces);
+        }
+        let new_idx = ctx
+            .zfs
+            .create_user_file(path_slice, 0o100644)
+            .ok_or(LinuxErrno::Enomem)?;
+        VfsNodeKind::ZenithFsInode(new_idx)
+    } else {
+        resolve_vfs_path(path_slice)?
+    };
+
+    // 2. Z-Cap Immutable System Guard:
+    // Block any attempt to open immutable system files (`/etc/*`, `/usr/bin/*`) for writing unless `SYS_ADMIN_IMMUTABLE` is held!
+    if wants_write {
+        match kind {
+            VfsNodeKind::ZenithFsInode(idx) => {
+                let is_immutable = ctx
+                    .zfs
+                    .inodes
+                    .get(idx)
+                    .map(|ino| ino.system_immutable)
+                    .unwrap_or(true);
+                if is_immutable && !ctx.current_zcaps.has(ZCapRights::SYS_ADMIN_IMMUTABLE) {
+                    ctx.zcap_blocks_count += 1;
+                    return Err(LinuxErrno::Eacces);
+                }
+            }
+            VfsNodeKind::OsRelease | VfsNodeKind::ProcVersion | VfsNodeKind::UsrBinHelloDeb => {
+                ctx.zcap_blocks_count += 1;
+                return Err(LinuxErrno::Eacces);
+            }
+            _ => {}
+        }
+    }
 
     let entry = match kind {
         VfsNodeKind::RootDir => CapabilityEntry {
@@ -465,6 +533,11 @@ fn sys_openat(
             object: CapObject::VfsFile { kind, offset: 0 },
             can_read: true,
             can_write: true,
+        },
+        VfsNodeKind::ZenithFsInode(_) => CapabilityEntry {
+            object: CapObject::VfsFile { kind, offset: 0 },
+            can_read: true,
+            can_write: wants_write,
         },
         _ => CapabilityEntry {
             object: CapObject::VfsFile { kind, offset: 0 },
@@ -523,14 +596,32 @@ fn sys_read(
             ctx.evdev_events_read += 1;
             Ok(24)
         }
+        CapObject::VfsFile {
+            kind: VfsNodeKind::ZenithFsInode(idx),
+            offset,
+        } => {
+            let max_len = (count as usize).min(128);
+            let mut tmp = [0u8; 128];
+            let dst_slice = tmp.get_mut(..max_len).ok_or(LinuxErrno::Efault)?;
+            let n = ctx
+                .zfs
+                .read_inode_data(idx, offset, dst_slice)
+                .ok_or(LinuxErrno::Einval)?;
+            if let Some(valid_out) = dst_slice.get(..n) {
+                copy_to_buffer(buf_ptr, valid_out).map_err(|_| LinuxErrno::Efault)?;
+            }
+            if let Some(Some(slot)) = ctx.fd_table.get_mut(fd as usize) {
+                slot.object = CapObject::VfsFile {
+                    kind: VfsNodeKind::ZenithFsInode(idx),
+                    offset: offset + n,
+                };
+            }
+            Ok(n as u64)
+        }
         CapObject::VfsFile { kind, offset } => {
             let content: &[u8] = match kind {
                 VfsNodeKind::OsRelease => OS_RELEASE_CONTENT,
-                VfsNodeKind::DebianVersion => DEBIAN_VERSION_DATA,
-                VfsNodeKind::AptSourcesList => APT_SOURCES_DATA,
-                VfsNodeKind::DpkgStatus => DPKG_STATUS_DATA,
                 VfsNodeKind::ProcVersion => PROC_VERSION_CONTENT,
-                VfsNodeKind::ProcFilesystems => PROC_FILESYSTEMS_DATA,
                 VfsNodeKind::DevNull => &[],
                 VfsNodeKind::DevZero => &[0u8; 128],
                 _ => return Err(LinuxErrno::Einval),
@@ -647,19 +738,27 @@ fn sys_chdir(ctx: &mut KernelContext, path_ptr: u64) -> Result<u64, LinuxErrno> 
     Ok(0)
 }
 
-fn sys_newfstatat(path_ptr: u64, statbuf_ptr: u64) -> Result<u64, LinuxErrno> {
+fn sys_newfstatat(
+    ctx: &KernelContext,
+    path_ptr: u64,
+    statbuf_ptr: u64,
+) -> Result<u64, LinuxErrno> {
     let mut path_buf = [0u8; 64];
     let path_slice = read_cstr_from_user(path_ptr, &mut path_buf)?;
-    let _kind = resolve_vfs_path(path_slice)?;
+    if ctx.zfs.find_inode_by_path(path_slice).is_none() {
+        let _kind = resolve_vfs_path(path_slice)?;
+    }
     let zero_stat = [0u8; 144];
     copy_to_buffer(statbuf_ptr, &zero_stat).map_err(|_| LinuxErrno::Efault)?;
     Ok(0)
 }
 
-fn sys_faccessat(path_ptr: u64) -> Result<u64, LinuxErrno> {
+fn sys_faccessat(ctx: &KernelContext, path_ptr: u64) -> Result<u64, LinuxErrno> {
     let mut path_buf = [0u8; 64];
     let path_slice = read_cstr_from_user(path_ptr, &mut path_buf)?;
-    let _kind = resolve_vfs_path(path_slice)?;
+    if ctx.zfs.find_inode_by_path(path_slice).is_none() {
+        let _kind = resolve_vfs_path(path_slice)?;
+    }
     Ok(0)
 }
 
@@ -752,6 +851,26 @@ fn sys_write(
             let pipe = ctx.pipes.get_mut(pipe_idx).ok_or(LinuxErrno::Ebadf)?;
             let n = pipe.write_slice(slice);
             Ok(n as u64)
+        }
+        CapObject::VfsFile {
+            kind: VfsNodeKind::ZenithFsInode(idx),
+            offset,
+        } => {
+            let max_len = (count as usize).min(128);
+            let mut tmp = [0u8; 128];
+            let src_slice = tmp.get_mut(..max_len).ok_or(LinuxErrno::Efault)?;
+            copy_from_buffer(buf_ptr, src_slice).map_err(|_| LinuxErrno::Efault)?;
+            let written = ctx
+                .zfs
+                .write_inode_data(idx, offset, src_slice)
+                .ok_or(LinuxErrno::Eacces)?;
+            if let Some(Some(slot)) = ctx.fd_table.get_mut(fd as usize) {
+                slot.object = CapObject::VfsFile {
+                    kind: VfsNodeKind::ZenithFsInode(idx),
+                    offset: offset + written,
+                };
+            }
+            Ok(written as u64)
         }
         CapObject::VfsFile {
             kind: VfsNodeKind::DevFb0,
