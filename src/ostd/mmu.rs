@@ -3,7 +3,7 @@ use core::arch::asm;
 use crate::ostd::OstdError;
 
 pub const PAGE_SIZE: usize = 4096;
-const POOL_FRAMES: usize = 256;
+const POOL_FRAMES: usize = 512;
 
 #[repr(C, align(4096))]
 struct FramePool([[u8; PAGE_SIZE]; POOL_FRAMES]);
@@ -11,7 +11,7 @@ struct FramePool([[u8; PAGE_SIZE]; POOL_FRAMES]);
 static mut STATIC_FRAME_POOL: FramePool = FramePool([[0; PAGE_SIZE]; POOL_FRAMES]);
 
 pub struct BitmapFrameAllocator {
-    bitmap: [u64; 4],
+    bitmap: [u64; 8],
     base_addr: u64,
     pub hhdm_offset: u64,
     pub kernel_phys_base: u64,
@@ -27,7 +27,7 @@ impl Default for BitmapFrameAllocator {
 impl BitmapFrameAllocator {
     pub const fn const_uninit() -> Self {
         Self {
-            bitmap: [0; 4],
+            bitmap: [0; 8],
             base_addr: 0,
             hhdm_offset: 0xFFFF_8000_0000_0000,
             kernel_phys_base: 0,
@@ -57,7 +57,7 @@ impl BitmapFrameAllocator {
         }
 
         Self {
-            bitmap: [0; 4],
+            bitmap: [0; 8],
             base_addr,
             hhdm_offset,
             kernel_phys_base,
@@ -166,8 +166,6 @@ pub fn map_user_page(pmm: &mut BitmapFrameAllocator, user_va: u64) -> Result<u64
         return Err(OstdError::UnalignedAddress);
     }
 
-    let frame_kvirt = pmm.allocate_frame()?;
-    let frame_phys = pmm.kernel_virt_to_phys(frame_kvirt);
     let (p4_idx, p3_idx, p2_idx, p1_idx) = PageTable::indices(user_va);
 
     let cr3_raw: u64;
@@ -190,6 +188,23 @@ pub fn map_user_page(pmm: &mut BitmapFrameAllocator, user_va: u64) -> Result<u64
 
     // SAFETY:
     // `pt_virt` is a valid HHDM-mapped level-1 page table and `p1_idx < 512`.
+    // If the page is already mapped (e.g. shared page between adjacent GCC ELF segments),
+    // preserve the existing frame instead of overwriting it.
+    unsafe {
+        let existing = (*pt_virt).entries[p1_idx];
+        if (existing & PageFlags::PRESENT) != 0 {
+            let clean_phys = existing & 0x000F_FFFF_FFFF_F000;
+            (*pt_virt).entries[p1_idx] = clean_phys | PageFlags::USER_RWX;
+            flush_tlb(user_va);
+            return Ok(pmm.phys_to_hhdm_virt(clean_phys));
+        }
+    }
+
+    let frame_kvirt = pmm.allocate_frame()?;
+    let frame_phys = pmm.kernel_virt_to_phys(frame_kvirt);
+
+    // SAFETY:
+    // Installs the newly allocated physical frame into the level-1 page table entry.
     unsafe {
         (*pt_virt).entries[p1_idx] = (frame_phys & 0x000F_FFFF_FFFF_F000) | PageFlags::USER_RWX;
     }
