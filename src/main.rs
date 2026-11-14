@@ -48,7 +48,7 @@ macro_rules! kprintln {
 pub extern "C" fn _start() -> ! {
     ostd::SerialConsole::init();
     kprintln!("----------------------------------------------------------------");
-    kprintln!("ZenithOS 1.1.0 - x86_64 Framekernel (Z-Cap Security & ZenithFS)");
+    kprintln!("ZenithOS 1.5.0 - x86_64 Framekernel (Interactive VM & GPT Shim)");
     kprintln!("----------------------------------------------------------------");
 
     ostd::init_gdt_and_tss();
@@ -75,10 +75,6 @@ pub extern "C" fn _start() -> ! {
         kprintln!("[ZENITH-FS][FAIL] ZenithFS superblock or .deb installation failure.");
         ostd::exit_qemu(ostd::QemuExitCode::Failed);
     }
-    kprintln!(
-        "[ZENITH-PCI] Enumerated {} PCIe hardware controllers on Bus 0.",
-        ctx.pci_count
-    );
 
     let elf_image = linux_abi::build_embedded_linux_init_elf64();
     let loaded = match linux_abi::load_elf64_into_user_space(&elf_image, &mut ctx.pmm) {
@@ -94,11 +90,6 @@ pub extern "C" fn _start() -> ! {
         "[ZENITH-CORE] Entering Ring 3 ('/bin/init' -> SYS_execve -> '/usr/bin/hello-deb')..."
     );
     let exit_code = ostd::enter_user_space(loaded.entry_rip, loaded.user_rsp);
-    kprintln!(
-        "[ZENITH-CORE] Ring 3 .deb binary '/usr/bin/hello-deb' exited with status=0x{:x}.",
-        exit_code
-    );
-
     if exit_code != 0x66 {
         kprintln!(
             "[ZENITH-TEST][FAIL] Unexpected exit status: 0x{:x} (expected 0x66).",
@@ -107,7 +98,11 @@ pub extern "C" fn _start() -> ! {
         ostd::exit_qemu(ostd::QemuExitCode::Failed);
     }
 
-    // Verify `/home/user/zenith.txt` was dynamically created on ZenithFS with valid FNV-1a checksum
+    if !ctx.zfs.verify_gpt_and_shim_install() {
+        kprintln!("[ZENITH-TEST][FAIL] GPT partition table or UEFI Shim installation failed.");
+        ostd::exit_qemu(ostd::QemuExitCode::Failed);
+    }
+
     let user_ino_idx = match ctx.zfs.find_inode_by_path(b"/home/user/zenith.txt") {
         Some(idx) => idx,
         None => {
@@ -124,20 +119,17 @@ pub extern "C" fn _start() -> ! {
         ostd::exit_qemu(ostd::QemuExitCode::Failed);
     }
 
-    ctx.render_terminal_bytes(b"user@zenith-os:~$ cat /home/user/zenith.txt\n");
-    ctx.render_terminal_bytes(b"ZFS1_USER_FILE_OK (FNV-1a Checksum Verified)\n");
-    ctx.render_terminal_bytes(b"user@zenith-os:~$ _\n");
-
-    kprintln!(
-        "[ZENITH-ZCAP] Verified passwordless file creation & blocked {} unauthorized system write.",
-        ctx.zcap_blocks_count
-    );
-
+    kprintln!("[ZENITH-INSTALL] Verified GPT ('EFI PART'), ESP Shim+MOK, and ZenithFS on /dev/vda.");
     kprintln!("----------------------------------------------------------------");
-    kprintln!("[ZENITH-CI] ALL Z-CAP SECURITY, ZENITHFS & DEBIAN 13 TESTS PASS");
+    kprintln!("[ZENITH-CI] ALL GPT INSTALLER, SHIM SECURE BOOT & ABI TESTS PASS");
     kprintln!("----------------------------------------------------------------");
 
-    ostd::exit_qemu(ostd::QemuExitCode::Success);
+    // 1. On GitHub Actions CI (where isa-debug-exit is attached to port 0xF4), QEMU exits here with code 33.
+    ostd::notify_ci_success();
+
+    // 2. On your personal VM (VirtualBox / VMware / QEMU) or real PC, execution continues right here
+    //    into the live interactive PS/2 Keyboard Shell & Real-Time Clock loop!
+    ctx.run_interactive_desktop_loop();
 }
 
 #[panic_handler]
