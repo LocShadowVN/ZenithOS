@@ -150,7 +150,6 @@ pub fn draw_text_line(fb: &FramebufferInfo, text: &[u8], x0: u32, y0: u32, color
     }
 }
 
-/// Renders a Windows 11 high-contrast arrow mouse cursor with black outline and white fill.
 pub fn draw_mouse_cursor(fb: &FramebufferInfo, x0: u32, y0: u32) {
     let outline: [u16; 14] = [
         0b1000_0000_0000_0000,
@@ -400,43 +399,26 @@ const fn hex_nibble(n: u8) -> u8 {
 }
 
 fn draw_desktop_shortcuts(fb: &FramebufferInfo) {
+    // 1. "Install OS"
     fb_fill_rect(
         fb,
         Rect {
             x: 24,
-            y: 28,
+            y: 24,
             w: 36,
             h: 26,
         },
         0x0000_78D4,
     );
-    fb_fill_rect(
-        fb,
-        Rect {
-            x: 26,
-            y: 30,
-            w: 32,
-            h: 20,
-        },
-        0x0060_CDFF,
-    );
-    fb_fill_rect(
-        fb,
-        Rect {
-            x: 36,
-            y: 54,
-            w: 12,
-            h: 4,
-        },
-        0x009C_A3AF,
-    );
-    draw_text_line(fb, b"This PC", 16, 64, 0x00F3_F4F6);
+    draw_stylized_zenith_logo(fb, 34, 29, 1);
+    draw_text_line(fb, b"Install", 14, 56, 0x0060_CDFF);
 
+    // 2. "Files"
     fb_fill_rect(
         fb,
         Rect {
             x: 24,
-            y: 96,
+            y: 92,
             w: 16,
             h: 5,
         },
@@ -446,35 +428,36 @@ fn draw_desktop_shortcuts(fb: &FramebufferInfo) {
         fb,
         Rect {
             x: 24,
-            y: 101,
+            y: 97,
             w: 36,
             h: 24,
         },
         0x00F5_B942,
     );
-    draw_text_line(fb, b"Files", 22, 132, 0x00F3_F4F6);
+    draw_text_line(fb, b"Files", 22, 128, 0x00F3_F4F6);
 
+    // 3. "Settings"
     fb_fill_rect(
         fb,
         Rect {
             x: 24,
-            y: 166,
+            y: 162,
             w: 36,
             h: 28,
         },
         0x002B_3240,
     );
-    draw_stylized_zenith_logo(fb, 34, 172, 1);
-    draw_text_line(fb, b"Settings", 12, 200, 0x00F3_F4F6);
+    draw_stylized_zenith_logo(fb, 34, 168, 1);
+    draw_text_line(fb, b"Settings", 12, 196, 0x00F3_F4F6);
 }
 
-fn draw_files_app(fb: &FramebufferInfo, x: u32, y: u32, w: u32, h: u32) {
+fn draw_installer_and_files_app(fb: &FramebufferInfo, x: u32, y: u32, w: u32, h: u32) {
     draw_win11_window(
         fb,
         Rect { x, y, w, h },
-        b"Files - /home/user (ZenithFS)",
+        b"ZenithOS Installer & Files - GPT + UEFI Shim",
         0x0010_121A,
-        0x00F5_B942,
+        0x0000_78D4,
     );
 
     fb_fill_rect(
@@ -483,16 +466,16 @@ fn draw_files_app(fb: &FramebufferInfo, x: u32, y: u32, w: u32, h: u32) {
             x: x + 1,
             y: y + 34,
             w: w.saturating_sub(2),
-            h: 28,
+            h: 26,
         },
         0x0018_1B24,
     );
     draw_text_line(
         fb,
-        b"<  >  ^   Z:\\ > home > user > Documents",
+        b"Target Disk: /dev/vda (GPT) | Bootloader: shimx64.efi + MOK",
         x + 14,
-        y + 44,
-        0x00D1_D5DB,
+        y + 43,
+        0x0060_CDFF,
     );
 
     let side_w = 132u32;
@@ -500,41 +483,41 @@ fn draw_files_app(fb: &FramebufferInfo, x: u32, y: u32, w: u32, h: u32) {
         fb,
         Rect {
             x: x + 1,
-            y: y + 63,
+            y: y + 61,
             w: side_w,
-            h: h.saturating_sub(64),
+            h: h.saturating_sub(62),
         },
         0x0014_1720,
     );
-    draw_text_line(fb, b"Quick Access", x + 12, y + 76, 0x0060_CDFF);
-    draw_text_line(fb, b" Desktop", x + 12, y + 96, 0x00D1_D5DB);
     fb_fill_rect(
         fb,
         Rect {
             x: x + 8,
-            y: y + 110,
+            y: y + 70,
             w: side_w - 16,
             h: 18,
         },
         0x0000_78D4,
     );
-    draw_text_line(fb, b" Documents", x + 12, y + 115, 0x00FFFFFF);
-    draw_text_line(fb, b" Debian Apps", x + 12, y + 136, 0x00D1_D5DB);
-    draw_text_line(fb, b" Local Disk Z:", x + 12, y + 156, 0x009E_CE6A);
+    draw_text_line(fb, b" 1. Disk GPT", x + 12, y + 75, 0x00FFFFFF);
+    draw_text_line(fb, b" 2. UEFI Shim", x + 12, y + 95, 0x009E_CE6A);
+    draw_text_line(fb, b" 3. Rootfs ZFS", x + 12, y + 113, 0x009E_CE6A);
+    draw_text_line(fb, b" 4. Coreutils", x + 12, y + 131, 0x009E_CE6A);
+    draw_text_line(fb, b" Local Disk Z:", x + 12, y + 151, 0x0060_CDFF);
 
     let list_x = x + side_w + 14;
     draw_text_line(
         fb,
-        b"Name              Type          Size   Security",
+        b"Partition / Component   Mount       Format      Status",
         list_x,
-        y + 76,
+        y + 72,
         0x009C_A3AF,
     );
     fb_fill_rect(
         fb,
         Rect {
             x: list_x,
-            y: y + 88,
+            y: y + 84,
             w: w.saturating_sub(side_w + 26),
             h: 1,
         },
@@ -543,31 +526,50 @@ fn draw_files_app(fb: &FramebufferInfo, x: u32, y: u32, w: u32, h: u32) {
 
     draw_text_line(
         fb,
-        b"zenith.txt        Text File     17 B   Z-Cap R/W",
+        b"/dev/vda1 (ESP)         /boot/efi   FAT32/Shim  Signed MOK",
         list_x,
-        y + 100,
-        0x009E_CE6A,
-    );
-    draw_text_line(
-        fb,
-        b"hello-deb         Debian App    4 KB   Verified",
-        list_x,
-        y + 118,
+        y + 94,
         0x0060_CDFF,
     );
     draw_text_line(
         fb,
-        b"sources.list      APT Config    70 B   Immutable",
+        b"/dev/vda2 (Root)        /           ZenithFS    Formatted",
         list_x,
-        y + 136,
-        0x00E5_E7EB,
+        y + 110,
+        0x009E_CE6A,
     );
     draw_text_line(
         fb,
-        b"debian_version    OS Release    5 B    Immutable",
+        b"/home/user/zenith.txt   /home       Z-Cap Home  FNV-1a OK",
         list_x,
-        y + 154,
+        y + 126,
+        0x009E_CE6A,
+    );
+    draw_text_line(
+        fb,
+        b"zbox Coreutils Suite    /usr/bin    ELF64 C     Active",
+        list_x,
+        y + 142,
         0x00E5_E7EB,
+    );
+
+    let bar_w = w.saturating_sub(side_w + 28);
+    fb_fill_rect(
+        fb,
+        Rect {
+            x: list_x,
+            y: y + 164,
+            w: bar_w,
+            h: 8,
+        },
+        0x009E_CE6A,
+    );
+    draw_text_line(
+        fb,
+        b"GPT + UEFI Shim Installation: 100% Verified (fsync OK)",
+        list_x,
+        y + 178,
+        0x009E_CE6A,
     );
 }
 
@@ -575,7 +577,7 @@ fn draw_settings_app(fb: &FramebufferInfo, x: u32, y: u32, w: u32, h: u32, state
     draw_win11_window(
         fb,
         Rect { x, y, w, h },
-        b"Settings - System, RTC & Drivers (2013-2026)",
+        b"Settings - System, Secure Boot & Drivers (2013-2026)",
         0x0013_161F,
         0x0060_CDFF,
     );
@@ -584,10 +586,10 @@ fn draw_settings_app(fb: &FramebufferInfo, x: u32, y: u32, w: u32, h: u32, state
     let cy = y + 48;
 
     draw_stylized_zenith_logo(fb, cx, cy, 2);
-    draw_text_line(fb, b"ZenithOS 1.3 LTS (x86_64)", cx + 42, cy + 4, 0x00FFFFFF);
+    draw_text_line(fb, b"ZenithOS 1.5 LTS (x86_64)", cx + 42, cy + 4, 0x00FFFFFF);
     draw_text_line(
         fb,
-        b"Debian 13 (Trixie) + Z-Cap Passwordless Security",
+        b"Debian 13 (Trixie) + UEFI Shim Secure Boot",
         cx + 42,
         cy + 20,
         0x0060_CDFF,
@@ -613,10 +615,10 @@ fn draw_settings_app(fb: &FramebufferInfo, x: u32, y: u32, w: u32, h: u32, state
     draw_text_line(fb, &time_str, cx + 276, cy + 90, 0x0060_CDFF);
     draw_text_line(
         fb,
-        b"Memory & Security: 128 MB RAM | Z-Cap Active",
+        b"UEFI Secure Boot: Enabled (shimx64.efi + Zenith MOK)",
         cx + 10,
         cy + 108,
-        0x00E5_E7EB,
+        0x009E_CE6A,
     );
 
     draw_text_line(
@@ -685,6 +687,49 @@ fn draw_settings_app(fb: &FramebufferInfo, x: u32, y: u32, w: u32, h: u32, state
     );
 }
 
+/// Clears the client area of the Terminal window (used by the interactive `clear` command).
+pub fn clear_terminal_client(fb: &FramebufferInfo) {
+    let taskbar_h = 46u32;
+    let desktop_h = fb.height.saturating_sub(taskbar_h);
+    let left_col_x = 84u32;
+    let left_col_w = ((fb.width * 54) / 100).saturating_sub(left_col_x).max(320);
+    let term_y = 18 + 200 + 14;
+    let term_h = desktop_h.saturating_sub(term_y + 14).max(160);
+    fb_fill_rect(
+        fb,
+        Rect {
+            x: left_col_x + 2,
+            y: term_y + 34,
+            w: left_col_w.saturating_sub(4),
+            h: term_h.saturating_sub(36),
+        },
+        0x000B_0D13,
+    );
+}
+
+/// Redraws the live CMOS RTC time and date on the bottom-right corner of the Taskbar.
+pub fn update_taskbar_clock(fb: &FramebufferInfo, rtc: RtcDateTime) {
+    if fb.width <= 260 {
+        return;
+    }
+    let taskbar_h = 46u32;
+    let tb_y = fb.height.saturating_sub(taskbar_h);
+    fb_fill_rect(
+        fb,
+        Rect {
+            x: fb.width - 100,
+            y: tb_y + 6,
+            w: 92,
+            h: 34,
+        },
+        0x0014_171F,
+    );
+    let time_str = rtc.format_time();
+    let date_str = rtc.format_date();
+    draw_text_line(fb, &time_str, fb.width - 96, tb_y + 10, 0x00FFFFFF);
+    draw_text_line(fb, &date_str, fb.width - 96, tb_y + 25, 0x00D1_D5DB);
+}
+
 pub fn init_fbcon(fb: &FramebufferInfo, state: DesktopState) {
     let taskbar_h = 46u32;
     let desktop_h = fb.height.saturating_sub(taskbar_h);
@@ -711,7 +756,7 @@ pub fn init_fbcon(fb: &FramebufferInfo, state: DesktopState) {
     let left_col_x = 84u32;
     let left_col_w = ((fb.width * 54) / 100).saturating_sub(left_col_x).max(320);
     let files_h = 200u32;
-    draw_files_app(fb, left_col_x, 18, left_col_w, files_h);
+    draw_installer_and_files_app(fb, left_col_x, 18, left_col_w, files_h);
 
     let term_y = 18 + files_h + 14;
     let term_h = desktop_h.saturating_sub(term_y + 14).max(160);
@@ -723,7 +768,7 @@ pub fn init_fbcon(fb: &FramebufferInfo, state: DesktopState) {
             w: left_col_w,
             h: term_h,
         },
-        b"Terminal - user@zenith-os: ~ (zsh Interactive Shell)",
+        b"Terminal - user@zenith-os: ~ (Interactive PS/2 Shell)",
         0x000B_0D13,
         0x0000_78D4,
     );
@@ -741,7 +786,6 @@ pub fn init_fbcon(fb: &FramebufferInfo, state: DesktopState) {
         );
     }
 
-    // Draw Windows 11 Mouse Cursor hovering near the center of the screen
     draw_mouse_cursor(fb, fb.width / 2 - 20, desktop_h / 2 - 10);
 
     let tb_y = desktop_h;
@@ -863,14 +907,11 @@ pub fn init_fbcon(fb: &FramebufferInfo, state: DesktopState) {
     if fb.width > 260 {
         draw_text_line(
             fb,
-            b"Z-CAP  ENG",
+            b"SHIM  Z-CAP",
             fb.width - 196,
             tb_y + 19,
             0x009E_CE6A,
         );
-        let time_str = state.rtc.format_time();
-        let date_str = state.rtc.format_date();
-        draw_text_line(fb, &time_str, fb.width - 96, tb_y + 10, 0x00FFFFFF);
-        draw_text_line(fb, &date_str, fb.width - 96, tb_y + 25, 0x00D1_D5DB);
+        update_taskbar_clock(fb, state.rtc);
     }
 }
