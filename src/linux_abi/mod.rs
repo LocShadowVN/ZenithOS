@@ -5,7 +5,10 @@ pub mod elf;
 pub mod vfs;
 pub mod zenithfs;
 
-pub use console::{ascii_to_glyph_8x8, draw_glyph_8x8, draw_text_line, init_fbcon, GlyphStyle};
+pub use console::{
+    ascii_to_glyph_8x8, draw_glyph_8x8, draw_stylized_zenith_logo, draw_text_line, init_fbcon,
+    GlyphStyle,
+};
 pub use elf::{
     build_embedded_linux_app_elf64, build_embedded_linux_init_elf64, load_elf64_into_user_space,
     ElfLoadError, LoadedElfProcess,
@@ -22,8 +25,8 @@ pub use zenithfs::{
 
 use crate::ostd::{
     copy_from_buffer, copy_to_buffer, fb_draw_pixel, map_user_page, poll_ps2_scancode, read_msr,
-    read_tsc, write_msr, BitmapFrameAllocator, FramebufferInfo, Msr, SerialConsole, TrapFrame,
-    PAGE_SIZE,
+    read_tsc, scan_pci_bus, write_msr, BitmapFrameAllocator, FramebufferInfo, Msr, PciDeviceInfo,
+    SerialConsole, TrapFrame, PAGE_SIZE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +147,8 @@ pub struct KernelContext {
     pub pmm: BitmapFrameAllocator,
     pub fb: FramebufferInfo,
     pub zfs: ZenithFsVolume,
+    pub pci_devices: [PciDeviceInfo; 8],
+    pub pci_count: usize,
     pub fb_pixels_written: u64,
     pub last_fb_pixel_color: u32,
     pub term_col: u32,
@@ -196,6 +201,8 @@ impl KernelContext {
             pmm: BitmapFrameAllocator::const_uninit(),
             fb: FramebufferInfo::const_uninit(),
             zfs: ZenithFsVolume::const_new(),
+            pci_devices: [PciDeviceInfo::empty(); 8],
+            pci_count: 0,
             fb_pixels_written: 0,
             last_fb_pixel_color: 0,
             term_col: 0,
@@ -222,13 +229,14 @@ impl KernelContext {
 
     pub fn init_hardware(&mut self) {
         self.pmm = BitmapFrameAllocator::new();
+        self.pci_count = scan_pci_bus(&mut self.pci_devices);
         self.zfs.format_and_mount();
         self.fb = FramebufferInfo::detect_from_limine();
-        init_fbcon(&self.fb);
+        init_fbcon(&self.fb, &self.pci_devices, self.pci_count);
         self.render_terminal_bytes(b"root@zenith-os:~# mount -t zenithfs /dev/vda1 /\n");
         self.render_terminal_bytes(b"[ZENITH-FS] Mounted ZFS1 volume 'ZENITH-TRIXIE' (Debian 13.0)\n");
         self.render_terminal_bytes(b"root@zenith-os:~# dpkg -i hello-trixie_1.0_amd64.deb\n");
-        self.render_terminal_bytes(b"Unpacking hello-trixie (1.0) to /usr/bin/hello-deb...\n");
+        self.render_terminal_bytes(b"Unpacking GCC ELF64 binary to /usr/bin/hello-deb...\n");
     }
 
     pub fn render_terminal_bytes(&mut self, bytes: &[u8]) {
