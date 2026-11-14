@@ -2,8 +2,6 @@ use core::arch::asm;
 
 use crate::ostd::{inb, inl, outb, outl};
 
-/// Hardware Real-Time Clock (MC146818 CMOS RTC) date and time structure.
-/// Compatible with all x86_64 PCs and laptops from 2013 to present.
 #[derive(Debug, Clone, Copy)]
 pub struct RtcDateTime {
     pub year: u16,
@@ -37,9 +35,7 @@ impl RtcDateTime {
         (val & 0x0F) + ((val / 16) * 10)
     }
 
-    /// Reads the current UTC date and time directly from the motherboard CMOS RTC (ports 0x70/0x71).
     pub fn read_from_cmos() -> Self {
-        // Wait until Status Register A (0x0A) Update-In-Progress (bit 7) is clear
         let mut spins = 0;
         while (Self::read_cmos_reg(0x0A) & 0x80) != 0 && spins < 10_000 {
             core::hint::spin_loop();
@@ -54,7 +50,6 @@ impl RtcDateTime {
         let mut year = Self::read_cmos_reg(0x09);
         let status_b = Self::read_cmos_reg(0x0B);
 
-        // Convert BCD to binary if Status Register B bit 2 is clear
         if (status_b & 0x04) == 0 {
             second = Self::bcd_to_bin(second);
             minute = Self::bcd_to_bin(minute);
@@ -75,22 +70,21 @@ impl RtcDateTime {
         }
     }
 
-    /// Formats `HH:MM UTC` (9 bytes) for the Windows 11 System Tray clock.
-    pub const fn format_time(&self) -> [u8; 9] {
+    /// Formats `HH:MM:SS` (8 bytes) for live clock updates.
+    pub const fn format_time(&self) -> [u8; 8] {
         [
             b'0' + (self.hour / 10),
             b'0' + (self.hour % 10),
             b':',
             b'0' + (self.minute / 10),
             b'0' + (self.minute % 10),
-            b' ',
-            b'U',
-            b'T',
-            b'C',
+            b':',
+            b'0' + (self.second / 10),
+            b'0' + (self.second % 10),
         ]
     }
 
-    /// Formats `DD/MM/YYYY` (10 bytes) for the Windows 11 System Tray date.
+    /// Formats `DD/MM/YYYY` (10 bytes).
     pub const fn format_date(&self) -> [u8; 10] {
         let y = self.year;
         [
@@ -115,7 +109,7 @@ fn cpuid_leaf(leaf: u32) -> (u32, u32, u32, u32) {
     let ecx: u32;
     let edx: u32;
     // SAFETY:
-    // Executes architectural `cpuid` instruction while preserving `rbx` as required by LLVM.
+    // Executes architectural `cpuid` instruction while preserving `rbx`.
     unsafe {
         asm!(
             "xchg rbx, {tmp}",
@@ -133,7 +127,6 @@ fn cpuid_leaf(leaf: u32) -> (u32, u32, u32, u32) {
     (eax, ebx, ecx, edx)
 }
 
-/// Reads the 48-byte hardware processor brand string via `CPUID` leaves `0x80000002..0x80000004`.
 pub fn read_cpu_brand() -> [u8; 48] {
     let mut brand = [b' '; 48];
     let (max_ext, _, _, _) = cpuid_leaf(0x8000_0000);
@@ -189,7 +182,6 @@ impl PciDeviceInfo {
         }
     }
 
-    /// Maps 2013–2026 PCIe hardware classes to their bound ZenithOS kernel driver module.
     pub const fn driver_description(&self) -> &'static [u8] {
         match (self.class_code, self.subclass, self.prog_if) {
             (0x01, 0x06, _) => b"ahci_sata  (SATA 3.0 AHCI Storage)",
