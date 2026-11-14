@@ -1,4 +1,4 @@
-name: ZenithOS Fast CI
+name: ZenithOS CI
 
 on:
   push:
@@ -12,7 +12,7 @@ env:
 
 jobs:
   build-and-qemu-test:
-    name: Build & Boot ZenithOS (x86_64 QEMU)
+    name: Build and Boot ZenithOS (x86_64 QEMU)
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -27,7 +27,7 @@ jobs:
           components: rust-src, llvm-tools-preview, rustfmt, clippy
           targets: x86_64-unknown-none
 
-      - name: Cache Cargo & build-std Artifacts
+      - name: Cache Cargo and build-std Artifacts
         uses: Swatinem/rust-cache@v2
         with:
           cache-all-crates: true
@@ -39,7 +39,7 @@ jobs:
           path: /tmp/limine
           key: limine-bin-${{ env.LIMINE_VERSION }}
 
-      - name: Install QEMU & ISO Tools (Fast apt-get)
+      - name: Install QEMU and ISO Tools
         run: |
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
@@ -47,13 +47,13 @@ jobs:
             xorriso \
             mtools
 
-      - name: Fetch & Build Limine CLI (if not cached)
+      - name: Fetch and Build Limine CLI
         if: steps.cache-limine.outputs.cache-hit != 'true'
         run: |
           git clone https://github.com/limine-bootloader/limine.git --branch=${{ env.LIMINE_VERSION }} --depth=1 /tmp/limine
           make -C /tmp/limine
 
-      - name: Auto-Format & Static Analysis (Clippy)
+      - name: Auto-Format and Static Analysis (Clippy)
         run: |
           cargo fmt --all
           cargo clippy -- -D warnings
@@ -61,7 +61,7 @@ jobs:
       - name: Build ZenithOS Kernel
         run: cargo build
 
-      - name: Package Bootable ZenithOS ISO (Limine)
+      - name: Package Bootable ZenithOS ISO
         run: |
           mkdir -p iso_root/boot/limine
           cp target/x86_64-unknown-none/debug/zenith-kernel iso_root/boot/
@@ -82,7 +82,7 @@ jobs:
             iso_root -o zenith-os.iso
           /tmp/limine/limine bios-install zenith-os.iso
 
-      - name: Run Automated Hardware & Linux ABI Tests in QEMU
+      - name: Run Automated Kernel Verification in QEMU
         run: |
           set +e
           timeout 15s qemu-system-x86_64 \
@@ -96,11 +96,55 @@ jobs:
             -device isa-debug-exit,iobase=0xf4,iosize=0x04
           EXIT_CODE=$?
           set -e
-          # QemuExitCode::Success (0x10) tạo ra exit status (0x10 << 1) | 1 = 33
           if [ $EXIT_CODE -eq 33 ]; then
-            echo "✅ ZenithOS booted and passed all automated tests!"
-            exit 0
+            echo "[PASS] ZenithOS booted and passed all verification tests."
           else
-            echo "❌ ZenithOS QEMU test failed with exit code: $EXIT_CODE"
+            echo "[FAIL] ZenithOS QEMU verification failed with exit code: $EXIT_CODE"
             exit 1
           fi
+
+      - name: Capture Hardware Framebuffer Screenshot (PNG)
+        run: |
+          (sleep 2; echo "screendump /tmp/fbcon.ppm"; sleep 1; echo "quit") | \
+          qemu-system-x86_64 \
+            -M q35 \
+            -cpu max \
+            -m 128M \
+            -cdrom zenith-os.iso \
+            -display none \
+            -monitor stdio \
+            -no-reboot >/dev/null 2>&1 || true
+
+          python3 - << 'EOF'
+          import struct, zlib
+          with open("/tmp/fbcon.ppm", "rb") as f:
+              _magic = f.readline()
+              dims = f.readline()
+              while dims.startswith(b"#"):
+                  dims = f.readline()
+              w, h = map(int, dims.split())
+              _maxval = f.readline()
+              rgb = f.read(w * h * 3)
+          raw_rows = b"".join(b"\x00" + rgb[y * w * 3:(y + 1) * w * 3] for y in range(h))
+          def chunk(tag, data):
+              crc = zlib.crc32(tag + data) & 0xffffffff
+              return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
+          png = (
+              b"\x89PNG\r\n\x1a\n"
+              + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+              + chunk(b"IDAT", zlib.compress(raw_rows, 6))
+              + chunk(b"IEND", b"")
+          )
+          with open("zenith-fbcon-screen.png", "wb") as f:
+              f.write(png)
+          print(f"[INFO] Captured framebuffer screenshot: {w}x{h} -> zenith-fbcon-screen.png")
+          EOF
+
+      - name: Upload Framebuffer Screenshot and Bootable ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: zenith-os-build-and-screen
+          path: |
+            zenith-fbcon-screen.png
+            zenith-os.iso
+          retention-days: 7
