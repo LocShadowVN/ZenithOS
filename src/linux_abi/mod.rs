@@ -3,8 +3,9 @@
 pub mod console;
 pub mod elf;
 pub mod vfs;
+pub mod zenithfs;
 
-pub use console::{ascii_to_glyph_8x8, draw_glyph_8x8, init_fbcon, GlyphStyle};
+pub use console::{ascii_to_glyph_8x8, draw_glyph_8x8, draw_text_line, init_fbcon, GlyphStyle};
 pub use elf::{
     build_embedded_linux_app_elf64, build_embedded_linux_init_elf64, load_elf64_into_user_space,
     ElfLoadError, LoadedElfProcess,
@@ -13,6 +14,10 @@ pub use vfs::{
     read_cstr_from_user, resolve_vfs_path, CapObject, CapabilityEntry, LinuxInputEvent,
     PipeRingBuffer, VfsNodeKind, MAX_FDS, MAX_PIPES, OS_RELEASE_CONTENT, PIPE_BUF_SIZE,
     PROC_VERSION_CONTENT,
+};
+pub use zenithfs::{
+    ZenithFsVolume, APT_SOURCES_DATA, DEBIAN_VERSION_DATA, DPKG_STATUS_DATA, PROC_FILESYSTEMS_DATA,
+    ZENITHFS_SUPER_MAGIC, ZFS_BLOCK_SIZE,
 };
 
 use crate::ostd::{
@@ -73,6 +78,7 @@ pub const SYS_UNAME: u64 = 63;
 pub const SYS_GETCWD: u64 = 79;
 pub const SYS_CHDIR: u64 = 80;
 pub const SYS_GETPPID: u64 = 110;
+pub const SYS_STATFS: u64 = 137;
 pub const SYS_ARCH_PRCTL: u64 = 158;
 pub const SYS_GETTID: u64 = 186;
 pub const SYS_FUTEX: u64 = 202;
@@ -137,6 +143,7 @@ pub const MAX_TASKS: usize = 8;
 pub struct KernelContext {
     pub pmm: BitmapFrameAllocator,
     pub fb: FramebufferInfo,
+    pub zfs: ZenithFsVolume,
     pub fb_pixels_written: u64,
     pub last_fb_pixel_color: u32,
     pub term_col: u32,
@@ -188,6 +195,7 @@ impl KernelContext {
         Self {
             pmm: BitmapFrameAllocator::const_uninit(),
             fb: FramebufferInfo::const_uninit(),
+            zfs: ZenithFsVolume::const_new(),
             fb_pixels_written: 0,
             last_fb_pixel_color: 0,
             term_col: 0,
@@ -214,24 +222,35 @@ impl KernelContext {
 
     pub fn init_hardware(&mut self) {
         self.pmm = BitmapFrameAllocator::new();
+        self.zfs.format_and_mount();
         self.fb = FramebufferInfo::detect_from_limine();
         init_fbcon(&self.fb);
+        self.render_terminal_bytes(b"root@zenith-os:~# mount -t zenithfs /dev/vda1 /\n");
+        self.render_terminal_bytes(b"[ZENITH-FS] Mounted ZFS1 volume 'ZENITH-TRIXIE' (Debian 13.0)\n");
+        self.render_terminal_bytes(b"root@zenith-os:~# dpkg -i hello-trixie_1.0_amd64.deb\n");
+        self.render_terminal_bytes(b"Unpacking hello-trixie (1.0) to /usr/bin/hello-deb...\n");
     }
 
     pub fn render_terminal_bytes(&mut self, bytes: &[u8]) {
-        let max_cols = (self.fb.width.saturating_sub(16) / 8).max(40);
+        let win1_w = ((self.fb.width * 58) / 100).saturating_sub(56).max(280);
+        let max_cols = (win1_w / 8).max(32);
         for &ch in bytes {
             if ch == b'\n' {
                 self.term_col = 0;
-                self.term_row = (self.term_row + 1) % 28;
+                self.term_row = (self.term_row + 1) % 36;
                 continue;
             }
             if ch == b'\r' {
                 self.term_col = 0;
                 continue;
             }
-            let px_x = 8 + self.term_col * 8;
-            let px_y = 28 + self.term_row * 10;
+            let px_x = 38 + self.term_col * 8;
+            let px_y = 72 + self.term_row * 12;
+            let color = if self.term_row == 0 || self.term_row == 2 {
+                0x0060_CDFF
+            } else {
+                0x00E5_E7EB
+            };
             draw_glyph_8x8(
                 &self.fb,
                 ascii_to_glyph_8x8(ch),
@@ -239,13 +258,13 @@ impl KernelContext {
                     x: px_x,
                     y: px_y,
                     scale: 1,
-                    color: 0x00C0_C0C0,
+                    color,
                 },
             );
             self.term_col += 1;
             if self.term_col >= max_cols {
                 self.term_col = 0;
-                self.term_row = (self.term_row + 1) % 28;
+                self.term_row = (self.term_row + 1) % 36;
             }
             self.term_chars_rendered += 1;
         }
@@ -286,7 +305,7 @@ impl LinuxUtsName {
         Self::fill_field(&mut uts.sysname, b"Linux");
         Self::fill_field(&mut uts.nodename, b"zenith-os");
         Self::fill_field(&mut uts.release, b"6.8.0-zenith-framekernel");
-        Self::fill_field(&mut uts.version, b"#1 SMP PREEMPT_DYNAMIC ZenithOS Rust");
+        Self::fill_field(&mut uts.version, b"#1 SMP PREEMPT_DYNAMIC ZenithOS Debian 13");
         Self::fill_field(&mut uts.machine, b"x86_64");
         Self::fill_field(&mut uts.domainname, b"(none)");
         uts
@@ -343,6 +362,7 @@ pub fn dispatch_linux_syscall(frame: &mut TrapFrame, ctx: &mut KernelContext) {
         SYS_UNAME => sys_uname(frame.rdi),
         SYS_GETCWD => sys_getcwd(ctx, frame.rdi, frame.rsi),
         SYS_CHDIR => sys_chdir(ctx, frame.rdi),
+        SYS_STATFS => sys_statfs(ctx, frame.rdi, frame.rsi),
         SYS_ARCH_PRCTL => sys_arch_prctl(frame.rdi, frame.rsi),
         SYS_FUTEX => sys_futex(ctx, frame.rdi, frame.rsi, frame.rdx as u32),
         SYS_GETDENTS64 => sys_getdents64(ctx, frame.rdi, frame.rsi, frame.rdx),
@@ -371,6 +391,21 @@ pub fn dispatch_linux_syscall(frame: &mut TrapFrame, ctx: &mut KernelContext) {
         Ok(val) => val,
         Err(errno) => errno.as_neg_ret(),
     };
+}
+
+fn sys_statfs(ctx: &KernelContext, path_ptr: u64, buf_ptr: u64) -> Result<u64, LinuxErrno> {
+    let mut path_buf = [0u8; 64];
+    let path_slice = read_cstr_from_user(path_ptr, &mut path_buf)?;
+    let _kind = resolve_vfs_path(path_slice)?;
+
+    let mut statfs_bytes = [0u8; 64];
+    statfs_bytes[0..8].copy_from_slice(&ZENITHFS_SUPER_MAGIC.to_le_bytes());
+    statfs_bytes[8..16].copy_from_slice(&(ctx.zfs.superblock.block_size as u64).to_le_bytes());
+    statfs_bytes[16..24].copy_from_slice(&(ctx.zfs.superblock.total_blocks as u64).to_le_bytes());
+    statfs_bytes[24..32].copy_from_slice(&(ctx.zfs.superblock.free_blocks as u64).to_le_bytes());
+    statfs_bytes[32..40].copy_from_slice(&(ctx.zfs.superblock.free_blocks as u64).to_le_bytes());
+    copy_to_buffer(buf_ptr, &statfs_bytes).map_err(|_| LinuxErrno::Efault)?;
+    Ok(0)
 }
 
 fn sys_epoll_create1(ctx: &mut KernelContext) -> Result<u64, LinuxErrno> {
@@ -483,7 +518,11 @@ fn sys_read(
         CapObject::VfsFile { kind, offset } => {
             let content: &[u8] = match kind {
                 VfsNodeKind::OsRelease => OS_RELEASE_CONTENT,
+                VfsNodeKind::DebianVersion => DEBIAN_VERSION_DATA,
+                VfsNodeKind::AptSourcesList => APT_SOURCES_DATA,
+                VfsNodeKind::DpkgStatus => DPKG_STATUS_DATA,
                 VfsNodeKind::ProcVersion => PROC_VERSION_CONTENT,
+                VfsNodeKind::ProcFilesystems => PROC_FILESYSTEMS_DATA,
                 VfsNodeKind::DevNull => &[],
                 VfsNodeKind::DevZero => &[0u8; 128],
                 _ => return Err(LinuxErrno::Einval),
@@ -622,6 +661,12 @@ fn sys_execve(frame: &mut TrapFrame, ctx: &mut KernelContext) -> Result<u64, Lin
     let kind = resolve_vfs_path(path_slice)?;
 
     let elf_image = match kind {
+        VfsNodeKind::UsrBinHelloDeb => {
+            if !ctx.zfs.deb_installed {
+                return Err(LinuxErrno::Enoent);
+            }
+            ctx.zfs.installed_deb_elf
+        }
         VfsNodeKind::BinApp => build_embedded_linux_app_elf64(),
         VfsNodeKind::BinInit => build_embedded_linux_init_elf64(),
         _ => return Err(LinuxErrno::Eacces),
