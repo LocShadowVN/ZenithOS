@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use crate::ostd::{fb_fill_rect, FramebufferInfo, Rect};
+use crate::ostd::{fb_fill_rect, FramebufferInfo, PciDeviceInfo, Rect};
 
 #[derive(Clone, Copy)]
 pub struct GlyphStyle {
@@ -10,10 +10,8 @@ pub struct GlyphStyle {
     pub color: u32,
 }
 
-/// Complete 8x8 bitmap font supporting uppercase, lowercase, digits, and standard punctuation.
 pub const fn ascii_to_glyph_8x8(ch: u8) -> [u8; 8] {
     match ch {
-        // Uppercase A-Z
         b'A' => [0x3C, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00],
         b'B' => [0x7C, 0x66, 0x66, 0x7C, 0x66, 0x66, 0x7C, 0x00],
         b'C' => [0x3C, 0x66, 0x60, 0x60, 0x60, 0x66, 0x3C, 0x00],
@@ -40,7 +38,6 @@ pub const fn ascii_to_glyph_8x8(ch: u8) -> [u8; 8] {
         b'X' => [0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00],
         b'Y' => [0x66, 0x66, 0x66, 0x3C, 0x18, 0x18, 0x18, 0x00],
         b'Z' => [0x7E, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x7E, 0x00],
-        // Lowercase a-z
         b'a' => [0x00, 0x00, 0x3C, 0x06, 0x3E, 0x66, 0x3E, 0x00],
         b'b' => [0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x7C, 0x00],
         b'c' => [0x00, 0x00, 0x3C, 0x60, 0x60, 0x60, 0x3C, 0x00],
@@ -67,7 +64,6 @@ pub const fn ascii_to_glyph_8x8(ch: u8) -> [u8; 8] {
         b'x' => [0x00, 0x00, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x00],
         b'y' => [0x00, 0x00, 0x66, 0x66, 0x66, 0x3E, 0x06, 0x3C],
         b'z' => [0x00, 0x00, 0x7E, 0x0C, 0x18, 0x30, 0x7E, 0x00],
-        // Digits 0-9
         b'0' => [0x3C, 0x66, 0x6E, 0x76, 0x66, 0x66, 0x3C, 0x00],
         b'1' => [0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x7E, 0x00],
         b'2' => [0x3C, 0x66, 0x06, 0x0C, 0x18, 0x30, 0x7E, 0x00],
@@ -78,7 +74,6 @@ pub const fn ascii_to_glyph_8x8(ch: u8) -> [u8; 8] {
         b'7' => [0x7E, 0x06, 0x0C, 0x18, 0x30, 0x30, 0x30, 0x00],
         b'8' => [0x3C, 0x66, 0x66, 0x3C, 0x66, 0x66, 0x3C, 0x00],
         b'9' => [0x3C, 0x66, 0x66, 0x3E, 0x06, 0x06, 0x3C, 0x00],
-        // Symbols & Punctuation
         b'&' => [0x38, 0x6C, 0x38, 0x76, 0xDC, 0xCC, 0x76, 0x00],
         b'=' => [0x00, 0x00, 0x7E, 0x00, 0x7E, 0x00, 0x00, 0x00],
         b'+' => [0x00, 0x18, 0x18, 0x7E, 0x18, 0x18, 0x00, 0x00],
@@ -136,6 +131,78 @@ pub fn draw_text_line(fb: &FramebufferInfo, text: &[u8], x0: u32, y0: u32, color
                 color,
             },
         );
+    }
+}
+
+/// Renders the stylized geometric ZenithOS "Z" emblem (3-layer precision vector-bitmap).
+/// - Top horizontal blade: Fluent Ice Cyan (`#60CDFF`)
+/// - Diagonal precision slash: Zenith Cobalt (`#0078D4`)
+/// - Bottom horizontal blade: Electric Blue (`#3B82F6`)
+pub fn draw_stylized_zenith_logo(fb: &FramebufferInfo, x0: u32, y0: u32, scale: u32) {
+    let top_blade: [u16; 3] = [0b1111_1111_1111_1100, 0b0111_1111_1111_1110, 0b0011_1111_1111_1100];
+    let diag_slash: [u16; 10] = [
+        0b0000_0000_0111_1000,
+        0b0000_0000_1111_0000,
+        0b0000_0001_1110_0000,
+        0b0000_0011_1100_0000,
+        0b0000_0111_1000_0000,
+        0b0000_1111_0000_0000,
+        0b0001_1110_0000_0000,
+        0b0011_1100_0000_0000,
+        0b0111_1000_0000_0000,
+        0b1111_0000_0000_0000,
+    ];
+    let bot_blade: [u16; 3] = [0b0011_1111_1111_1100, 0b0111_1111_1111_1110, 0b0011_1111_1111_1111];
+
+    for (r, &bits) in top_blade.iter().enumerate() {
+        for c in 0..16u32 {
+            if (bits & (1 << (15 - c))) != 0 {
+                fb_fill_rect(
+                    fb,
+                    Rect {
+                        x: x0 + c * scale,
+                        y: y0 + (r as u32) * scale,
+                        w: scale,
+                        h: scale,
+                    },
+                    0x0060_CDFF,
+                );
+            }
+        }
+    }
+
+    for (r, &bits) in diag_slash.iter().enumerate() {
+        for c in 0..16u32 {
+            if (bits & (1 << (15 - c))) != 0 {
+                fb_fill_rect(
+                    fb,
+                    Rect {
+                        x: x0 + c * scale,
+                        y: y0 + ((r + 3) as u32) * scale,
+                        w: scale,
+                        h: scale,
+                    },
+                    0x0000_78D4,
+                );
+            }
+        }
+    }
+
+    for (r, &bits) in bot_blade.iter().enumerate() {
+        for c in 0..16u32 {
+            if (bits & (1 << (15 - c))) != 0 {
+                fb_fill_rect(
+                    fb,
+                    Rect {
+                        x: x0 + c * scale,
+                        y: y0 + ((r + 13) as u32) * scale,
+                        w: scale,
+                        h: scale,
+                    },
+                    0x003B_82F6,
+                );
+            }
+        }
     }
 }
 
@@ -238,7 +305,16 @@ fn draw_win11_window(
     }
 }
 
-pub fn init_fbcon(fb: &FramebufferInfo) {
+const fn hex_nibble(n: u8) -> u8 {
+    let v = n & 0x0F;
+    if v < 10 {
+        b'0' + v
+    } else {
+        b'a' + (v - 10)
+    }
+}
+
+pub fn init_fbcon(fb: &FramebufferInfo, pci_devs: &[PciDeviceInfo; 8], pci_count: usize) {
     let taskbar_h = 44u32;
     let desktop_h = fb.height.saturating_sub(taskbar_h);
 
@@ -276,17 +352,9 @@ pub fn init_fbcon(fb: &FramebufferInfo) {
         0x0009_1224,
     );
 
+    // Stylized "Z" Brand Watermark in center of desktop
     if fb.width >= 640 && fb.height >= 360 {
-        fb_fill_rect(
-            fb,
-            Rect {
-                x: fb.width / 4,
-                y: 20,
-                w: fb.width / 2,
-                h: desktop_h.saturating_sub(40),
-            },
-            0x0014_2B52,
-        );
+        draw_stylized_zenith_logo(fb, fb.width / 2 - 48, desktop_h / 2 - 48, 6);
     }
 
     // 2. Window 1 (Left): Zenith Terminal (Debian 13 Trixie amd64 Userland)
@@ -305,7 +373,7 @@ pub fn init_fbcon(fb: &FramebufferInfo) {
         0x0000_78D4,
     );
 
-    // 3. Window 2 (Right): ZenithFS Disk & Debian 13 Trixie Explorer
+    // 3. Window 2 (Right): ZenithOS 1.0 Brand, ZenithFS & Hardware PCIe Device Manager
     let win2_x = 24 + win1_w + 16;
     let win2_w = fb.width.saturating_sub(win2_x + 24);
     if win2_w >= 200 {
@@ -317,36 +385,40 @@ pub fn init_fbcon(fb: &FramebufferInfo) {
                 w: win2_w,
                 h: win_h,
             },
-            b"ZenithFS (ZFS1) & Debian 13 Explorer",
+            b"ZenithOS 1.0 - Hardware & ZenithFS",
             0x0014_161F,
             0x0060_CDFF,
         );
 
         let cx = win2_x + 16;
-        let cy = 74;
+        let cy = 72;
+
+        // Stylized Z Brand Emblem + OS Identity Header inside Window 2
+        draw_stylized_zenith_logo(fb, cx, cy, 2);
+        draw_text_line(fb, b"ZenithOS 1.0 Framekernel", cx + 42, cy + 4, 0x00FFFFFF);
         draw_text_line(
             fb,
-            b"Local Disk (Z:) - ZENITH-TRIXIE",
-            cx,
-            cy,
-            0x00F3_F4F6,
-        );
-        draw_text_line(
-            fb,
-            b"Filesystem: ZenithFS v1 (4096B blk)",
-            cx,
-            cy + 16,
-            0x009C_A3AF,
+            b"Debian 13 (Trixie) amd64 ABI",
+            cx + 42,
+            cy + 20,
+            0x0060_CDFF,
         );
 
+        draw_text_line(
+            fb,
+            b"Local Disk (Z:) - ZENITH-TRIXIE (ZFS1)",
+            cx,
+            cy + 44,
+            0x00F3_F4F6,
+        );
         let bar_w = win2_w.saturating_sub(32).min(360);
         fb_fill_rect(
             fb,
             Rect {
                 x: cx,
-                y: cy + 32,
+                y: cy + 60,
                 w: bar_w,
-                h: 10,
+                h: 8,
             },
             0x002B_2F3A,
         );
@@ -354,58 +426,70 @@ pub fn init_fbcon(fb: &FramebufferInfo) {
             fb,
             Rect {
                 x: cx,
-                y: cy + 32,
-                w: (bar_w * 42) / 100,
-                h: 10,
+                y: cy + 60,
+                w: (bar_w * 38) / 100,
+                h: 8,
             },
             0x0000_78D4,
         );
 
         draw_text_line(
             fb,
-            b"Debian 13 (Trixie) amd64 Rootfs:",
+            b"PCIe Hardware Bus Controllers:",
             cx,
-            cy + 56,
+            cy + 80,
+            0x0060_CDFF,
+        );
+        let max_show = pci_count.min(4);
+        for (i, dev) in pci_devs.iter().take(max_show).enumerate() {
+            let mut line = [b' '; 42];
+            line[0..4].copy_from_slice(b"00:0");
+            line[3] = hex_nibble(dev.slot);
+            line[4] = b'.';
+            line[5] = hex_nibble(dev.func);
+            line[6] = b' ';
+            line[7] = b'[';
+            line[8] = hex_nibble((dev.vendor_id >> 12) as u8);
+            line[9] = hex_nibble((dev.vendor_id >> 8) as u8);
+            line[10] = hex_nibble((dev.vendor_id >> 4) as u8);
+            line[11] = hex_nibble(dev.vendor_id as u8);
+            line[12] = b':';
+            line[13] = hex_nibble((dev.device_id >> 12) as u8);
+            line[14] = hex_nibble((dev.device_id >> 8) as u8);
+            line[15] = hex_nibble((dev.device_id >> 4) as u8);
+            line[16] = hex_nibble(dev.device_id as u8);
+            line[17] = b']';
+            line[18] = b' ';
+            let cname = dev.class_name();
+            let clen = cname.len().min(23);
+            line[19..19 + clen].copy_from_slice(&cname[..clen]);
+            draw_text_line(fb, &line, cx, cy + 98 + (i as u32) * 16, 0x00D1_D5DB);
+        }
+
+        draw_text_line(
+            fb,
+            b"Installed Debian 13 (.deb) Packages:",
+            cx,
+            cy + 172,
             0x0060_CDFF,
         );
         draw_text_line(
             fb,
-            b" [INO 1] /etc/debian_version (13.0)",
+            b" [x] base-files (13.0+trixie1 amd64)",
             cx,
-            cy + 74,
-            0x00D1_D5DB,
+            cy + 190,
+            0x009E_CE6A,
         );
         draw_text_line(
             fb,
-            b" [INO 2] /etc/apt/sources.list (trixie)",
+            b" [x] hello-trixie (1.0 GCC ELF64 .deb)",
             cx,
-            cy + 90,
-            0x00D1_D5DB,
-        );
-        draw_text_line(
-            fb,
-            b" [INO 3] /var/lib/dpkg/status",
-            cx,
-            cy + 106,
-            0x00D1_D5DB,
-        );
-        draw_text_line(
-            fb,
-            b" [INO 4] /proc/filesystems (zenithfs)",
-            cx,
-            cy + 122,
-            0x00D1_D5DB,
-        );
-        draw_text_line(
-            fb,
-            b" [INO 5] /usr/bin/hello-deb (.deb pkg)",
-            cx,
-            cy + 138,
+            cy + 206,
             0x009E_CE6A,
         );
     }
 
-    // 4. Windows 11 Bottom Taskbar
+    // 4. Windows 11 Bottom Taskbar with Stylized "Z" Start Button
     let tb_y = desktop_h;
     fb_fill_rect(
         fb,
@@ -429,49 +513,21 @@ pub fn init_fbcon(fb: &FramebufferInfo) {
     );
 
     let center_x = (fb.width / 2).saturating_sub(110);
-    let icon_y = tb_y + 12;
 
+    // Start Button Pill with Stylized Zenith "Z" Logo
     fb_fill_rect(
         fb,
         Rect {
-            x: center_x,
-            y: icon_y,
-            w: 9,
-            h: 9,
+            x: center_x - 4,
+            y: tb_y + 8,
+            w: 28,
+            h: 28,
         },
-        0x0060_CDFF,
+        0x0025_2832,
     );
-    fb_fill_rect(
-        fb,
-        Rect {
-            x: center_x + 11,
-            y: icon_y,
-            w: 9,
-            h: 9,
-        },
-        0x0000_78D4,
-    );
-    fb_fill_rect(
-        fb,
-        Rect {
-            x: center_x,
-            y: icon_y + 11,
-            w: 9,
-            h: 9,
-        },
-        0x0000_78D4,
-    );
-    fb_fill_rect(
-        fb,
-        Rect {
-            x: center_x + 11,
-            y: icon_y + 11,
-            w: 9,
-            h: 9,
-        },
-        0x0060_CDFF,
-    );
+    draw_stylized_zenith_logo(fb, center_x + 2, tb_y + 14, 1);
 
+    // Search Pill
     fb_fill_rect(
         fb,
         Rect {
@@ -484,6 +540,7 @@ pub fn init_fbcon(fb: &FramebufferInfo) {
     );
     draw_text_line(fb, b"Search", center_x + 48, tb_y + 18, 0x009C_A3AF);
 
+    // Terminal App Icon
     let term_icon_x = center_x + 140;
     fb_fill_rect(
         fb,
@@ -507,6 +564,7 @@ pub fn init_fbcon(fb: &FramebufferInfo) {
         0x0060_CDFF,
     );
 
+    // Explorer Folder Icon
     let exp_icon_x = center_x + 180;
     fb_fill_rect(
         fb,
@@ -532,7 +590,7 @@ pub fn init_fbcon(fb: &FramebufferInfo) {
     if fb.width > 240 {
         draw_text_line(
             fb,
-            b"ZFS1  DEB13  12:00",
+            b"PCIe  ZFS1  DEB13",
             fb.width - 156,
             tb_y + 18,
             0x00E5_E7EB,
