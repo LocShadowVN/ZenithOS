@@ -56,7 +56,8 @@ jobs:
       - name: Compile C Userland App with GCC and Package Debian 13 (.deb)
         run: |
           gcc -O2 -ffreestanding -nostdlib -fno-pie -no-pie \
-            -fno-stack-protector -mno-red-zone -fno-asynchronous-unwind-tables \
+            -mno-mmx -mno-sse -mno-sse2 -mno-red-zone \
+            -fno-stack-protector -fno-asynchronous-unwind-tables \
             -Wl,-e,_start -Wl,-Ttext=0x00501000 -Wl,-z,max-page-size=0x1000 \
             -Wl,--build-id=none \
             userland/hello_trixie.c -o userland/hello-deb.elf
