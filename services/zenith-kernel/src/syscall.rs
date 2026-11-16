@@ -28,7 +28,7 @@ pub const SYS_EXECVE: usize = 59;
 /// and writes the POSIX or NTSTATUS return code back into `ctx`.
 ///
 /// # Safety Invariants
-/// Relies strictly on `UserContextApi` safe trait methods; contains zero `unsafe` code.
+/// Relies strictly on `UserContextApi` safe trait methods; 100% safe Rust.
 pub fn dispatch_syscall<C: UserContextApi>(ctx: &mut C, personality: AbiPersonality) {
     let num = ctx.syscall_num();
     let args = ctx.syscall_args();
