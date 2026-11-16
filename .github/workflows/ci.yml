@@ -1,4 +1,3 @@
-# .github/workflows/ci.yml
 name: ZenithOS Framekernel CI
 
 on:
@@ -45,7 +44,13 @@ jobs:
 
       - name: Framekernel Safety Gate (Forbid unsafe in Services)
         run: |
-          if grep -rnw "unsafe" services/ | grep -v "#!\[forbid(unsafe_code)\]"; then
+          for lib in services/*/src/lib.rs; do
+            if ! grep -q '^#!\[forbid(unsafe_code)\]' "$lib"; then
+              echo "ERROR: Missing #![forbid(unsafe_code)] in $lib"
+              exit 1
+            fi
+          done
+          if grep -rn --include="*.rs" -v '^[[:space:]]*//' services/ | grep -w "unsafe" | grep -v "#!\[forbid(unsafe_code)\]"; then
             echo "ERROR: 'unsafe' detected inside services/ directory!"
             exit 1
           fi
