@@ -1,0 +1,9 @@
+# framework/zenith-frame/Cargo.toml
+[package]
+name = "zenith-frame"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZenithOS Framework (Trusted Computing Base)"
+
+[dependencies]
