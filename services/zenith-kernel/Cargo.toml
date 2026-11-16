@@ -1,0 +1,10 @@
+# services/zenith-kernel/Cargo.toml
+[package]
+name = "zenith-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZenithOS Safe Kernel Services (POSIX/Linux & WinNT Personalities)"
+
+[dependencies]
+zenith-frame = { path = "../../framework/zenith-frame" }
