@@ -1,6 +1,6 @@
 // services/zenith-kernel/src/lib.rs
 #![no_std]
-// OS Services layer: unsafe is strictly forbidden across the entire crate.
+// OS Services layer: 100% safe Rust enforced across the entire crate.
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
