@@ -1,0 +1,61 @@
+# .github/workflows/ci.yml
+name: ZenithOS Framekernel CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["main", "master"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt-check-and-test:
+    name: Auto-Format, Audit, Clippy, Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-unknown-none
+
+      - name: Auto-format code with cargo fmt
+        run: |
+          cargo fmt --all
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "Code formatting issues detected. Auto-formatting..."
+            if [[ "${{ github.event_name }}" == "push" ]]; then
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git add -A
+              git commit -m "style: auto-format rust code via cargo fmt"
+              git push
+            fi
+          fi
+
+      - name: Framekernel Safety Gate (Forbid unsafe in Services)
+        run: |
+          if grep -rnw "unsafe" services/ | grep -v "#!\[forbid(unsafe_code)\]"; then
+            echo "ERROR: 'unsafe' detected inside services/ directory!"
+            exit 1
+          fi
+          echo "Safety Gate Passed: 0 unsafe blocks in OS Services."
+
+      - name: Run strict Clippy lints
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run unit & integration tests (Host)
+        run: cargo test --workspace --verbose
+
+      - name: Build bare-metal no_std kernel target
+        run: cargo build --workspace --target x86_64-unknown-none --verbose
