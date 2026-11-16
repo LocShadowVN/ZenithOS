@@ -74,7 +74,10 @@ impl KernelServices {
     ///
     /// # Safety Invariants
     /// Zero heap allocation and zero raw pointer usage; bounded to a 64-byte stack buffer.
-    pub fn pipe_buffer_copy(reader: &mut VmReader<'_>, writer: &mut VmWriter<'_>) -> Result<usize, Error> {
+    pub fn pipe_buffer_copy(
+        reader: &mut VmReader<'_>,
+        writer: &mut VmWriter<'_>,
+    ) -> Result<usize, Error> {
         let mut temp = [0u8; 64];
         let to_read = temp.len().min(reader.remaining()).min(writer.remaining());
         let read_count = reader.read_bytes(&mut temp[..to_read])?;
