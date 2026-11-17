@@ -6,24 +6,30 @@
 
 //! ZenithOS Safe Kernel Services.
 //!
-//! Coordinates memory initialization, process address spaces, scheduling, and
-//! dual-personality (Linux POSIX & Windows NT) system call dispatching using
-//! 100% safe Rust abstractions provided by `zenith-frame`.
+//! Coordinates memory initialization, process address spaces, scheduling, ELF64 loading,
+//! VFS management, and dual-personality (Linux POSIX & Windows NT) system call
+//! dispatching using 100% safe Rust abstractions provided by `zenith-frame`.
 
+pub mod elf;
 pub mod syscall;
+pub mod vfs;
 
 use zenith_frame::memory::{FrameAllocator, VirtAddr, VmReader, VmWriter, PAGE_SIZE};
 use zenith_frame::sched::{Scheduler, TaskId};
 use zenith_frame::vm::{PageFlags, VmSpace};
 use zenith_frame::Error;
 
-/// Static state for Phase 1 Kernel Services bootstrap.
+/// Static state for Phase 1 & Phase 2 Kernel Services bootstrap.
 #[derive(Debug)]
 pub struct KernelServices {
     /// Physical frame allocator managing 256 frames (1 MiB pool).
     pub allocator: FrameAllocator<4>,
     /// Pre-allocated scheduler for up to 16 concurrent tasks.
     pub scheduler: Scheduler<16>,
+    /// Initial process File Descriptor table (`stdin`, `stdout`, `stderr` + 13 slots).
+    pub fd_table: vfs::FdTable<16>,
+    /// In-memory `initramfs` file table holding up to 8 boot files.
+    pub ramfs: vfs::RamFs<8>,
 }
 
 impl Default for KernelServices {
@@ -41,6 +47,8 @@ impl KernelServices {
         Self {
             allocator: FrameAllocator::new(),
             scheduler: Scheduler::new(),
+            fd_table: vfs::FdTable::new(),
+            ramfs: vfs::RamFs::new(),
         }
     }
 
@@ -88,7 +96,9 @@ impl KernelServices {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::elf::{map_elf64_segments, ELF64_EHDR_SIZE, ELF64_PHDR_SIZE};
     use crate::syscall::{dispatch_syscall, AbiPersonality, SYS_WRITE};
+    use crate::vfs::{FdEntry, InodeKind, STDERR_FD, STDIN_FD, STDOUT_FD};
     use zenith_frame::trap::UserContext;
     use zenith_frame::UserContextApi;
 
@@ -139,5 +149,75 @@ mod tests {
 
         dispatch_syscall(&mut ctx, AbiPersonality::LinuxPosix);
         assert_eq!(ctx.syscall_num() as isize, -38); // -ENOSYS
+    }
+
+    #[test]
+    fn test_phase2_elf64_loader_and_segment_mapping() {
+        let mut fake_elf = [0u8; ELF64_EHDR_SIZE + ELF64_PHDR_SIZE];
+        // Magic + ELFCLASS64 + ELFDATA2LSB
+        fake_elf[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+        fake_elf[4] = 2;
+        fake_elf[5] = 1;
+        // e_type = ET_EXEC (2), e_machine = EM_X86_64 (62)
+        fake_elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+        fake_elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        // e_entry = 0x0040_1000
+        fake_elf[24..32].copy_from_slice(&0x0040_1000u64.to_le_bytes());
+        // e_phoff = 64, e_phentsize = 56, e_phnum = 1
+        fake_elf[32..40].copy_from_slice(&(ELF64_EHDR_SIZE as u64).to_le_bytes());
+        fake_elf[54..56].copy_from_slice(&(ELF64_PHDR_SIZE as u16).to_le_bytes());
+        fake_elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+
+        // Program Header 0: PT_LOAD (1), PF_R | PF_X (5), vaddr = 0x0040_0000, memsz = 8192 (2 pages)
+        let ph = &mut fake_elf[ELF64_EHDR_SIZE..];
+        ph[0..4].copy_from_slice(&1u32.to_le_bytes());
+        ph[4..8].copy_from_slice(&5u32.to_le_bytes());
+        ph[16..24].copy_from_slice(&0x0040_0000u64.to_le_bytes());
+        ph[32..40].copy_from_slice(&4096u64.to_le_bytes());
+        ph[40..48].copy_from_slice(&8192u64.to_le_bytes());
+
+        let mut kernel = KernelServices::new();
+        let root_frame = kernel.allocator.alloc_frame().expect("root frame");
+        let mut vm_space = VmSpace::new(root_frame.start_paddr()).expect("vm_space");
+
+        let mapped = map_elf64_segments(&fake_elf, &mut vm_space, &mut kernel.allocator)
+            .expect("valid ELF64 should map cleanly");
+
+        assert_eq!(mapped.entry_rip, 0x0040_1000);
+        assert_eq!(mapped.mapped_pages, 2);
+        assert!(vm_space.query_page(VirtAddr(0x0040_0000)).is_ok());
+        assert!(vm_space.query_page(VirtAddr(0x0040_1000)).is_ok());
+    }
+
+    #[test]
+    fn test_phase2_vfs_ramfs_and_fd_table() {
+        let mut kernel = KernelServices::new();
+        assert!(kernel.fd_table.get(STDIN_FD).is_ok());
+        assert!(kernel.fd_table.get(STDOUT_FD).is_ok());
+        assert!(kernel.fd_table.get(STDERR_FD).is_ok());
+
+        let idx = kernel
+            .ramfs
+            .register_file(b"/sbin/init", b"ELF_INIT_PAYLOAD")
+            .expect("register init file");
+        let fd = kernel
+            .fd_table
+            .alloc_fd(FdEntry {
+                kind: InodeKind::RamFile { file_idx: idx },
+                offset: 0,
+                readable: true,
+                writable: false,
+            })
+            .expect("alloc fd 3");
+
+        assert_eq!(fd.0, 3);
+        let mut out_buf = [0u8; 16];
+        let mut writer = VmWriter::from_slice(&mut out_buf);
+        let read_len = kernel
+            .ramfs
+            .read_into(idx, 0, &mut writer)
+            .expect("read from ramfs");
+        assert_eq!(read_len, 16);
+        assert_eq!(&out_buf, b"ELF_INIT_PAYLOAD");
     }
 }
