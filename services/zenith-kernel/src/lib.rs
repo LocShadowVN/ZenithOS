@@ -154,9 +154,7 @@ impl KernelServices {
 mod tests {
     use super::*;
     use crate::elf::{map_elf64_segments, ELF64_EHDR_SIZE, ELF64_PHDR_SIZE};
-    use crate::process::{
-        encode_sysv_initial_stack, AuxvEntry, ProcessState, AT_ENTRY, AT_PAGESZ,
-    };
+    use crate::process::{encode_sysv_initial_stack, AuxvEntry, ProcessState, AT_ENTRY, AT_PAGESZ};
     use crate::syscall::dispatch_syscall;
     use crate::vfs::{FdEntry, InodeKind, STDERR_FD, STDIN_FD, STDOUT_FD};
     use zenith_frame::trap::UserContext;
