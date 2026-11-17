@@ -171,4 +171,50 @@ pub fn sys_uname(_utsname_ptr: usize) -> Result<usize, Error> {
 /// Rejects unknown sub-codes with `Err(Error::InvalidArgument)`.
 pub fn sys_arch_prctl(code: usize, _addr: usize) -> Result<usize, Error> {
     if code != ARCH_SET_FS {
-        retur
+        return Err(Error::InvalidArgument);
+    }
+    // TODO: requires arch_x86_64_write_fsbase_msr in zenith-frame
+    Err(Error::NotImplemented)
+}
+
+/// Handles Linux `sys_openat(dirfd, pathname_ptr, flags, mode)`.
+///
+/// # Safety Invariants
+/// Does not dereference `pathname_ptr` directly; requires `VmSpace` C-string reader.
+pub fn sys_openat(
+    _dirfd: usize,
+    _pathname_ptr: usize,
+    _flags: usize,
+    _mode: usize,
+) -> Result<usize, Error> {
+    // TODO: requires vmspace_read_cstr_from_user and VFS path resolver
+    Err(Error::NotImplemented)
+}
+
+/// Translates Windows NT (`ntdll`) syscalls to ZenithOS POSIX syscall equivalents
+/// following the Wine `ntdll` translation pattern.
+///
+/// # Safety Invariants
+/// Translates handles and object attributes purely in safe Rust before invoking VFS.
+pub fn dispatch_winnt_syscall(nt_syscall_num: usize, args: [usize; 6]) -> Result<usize, Error> {
+    // UNCERTAIN: Windows NT syscall numbers (e.g., NtCreateFile = 0x0055) — needs verification
+    // against specific Windows 10/11 build SSDT as NT syscall numbers vary across builds.
+    const NT_CREATE_FILE_WIN10_1809: usize = 0x0055;
+
+    match nt_syscall_num {
+        NT_CREATE_FILE_WIN10_1809 => nt_create_file_to_posix(args),
+        _ => {
+            // TODO: requires Wine-style SSDT syscall translation table
+            Err(Error::NotImplemented)
+        }
+    }
+}
+
+/// Translates `NtCreateFile` into an equivalent POSIX VFS open operation.
+///
+/// # Safety Invariants
+/// Validates `OBJECT_ATTRIBUTES` through safe `VmSpace` reads before path resolution.
+pub fn nt_create_file_to_posix(_args: [usize; 6]) -> Result<usize, Error> {
+    // TODO: requires OBJECT_ATTRIBUTES reader and vfs_open_posix
+    Err(Error::NotImplemented)
+}
