@@ -11,13 +11,23 @@
 //! dispatching using 100% safe Rust abstractions provided by `zenith-frame`.
 
 pub mod elf;
+pub mod process;
 pub mod syscall;
 pub mod vfs;
 
+use crate::process::{Pid, ProcessTable};
+use crate::syscall::{
+    dispatch_linux_syscall, dispatch_winnt_syscall, AbiPersonality, SYS_BRK, SYS_CLOSE, SYS_EXIT,
+    SYS_EXIT_GROUP, SYS_GETPID,
+};
+use crate::vfs::FileDescriptor;
 use zenith_frame::memory::{FrameAllocator, VirtAddr, VmReader, VmWriter, PAGE_SIZE};
 use zenith_frame::sched::{Scheduler, TaskId};
 use zenith_frame::vm::{PageFlags, VmSpace};
-use zenith_frame::Error;
+use zenith_frame::{Error, UserContextApi};
+
+/// Default base virtual address for user-space process heap (`brk`).
+pub const DEFAULT_USER_HEAP_BASE: VirtAddr = VirtAddr(0x0000_0000_1000_0000);
 
 /// Static state for Phase 1 & Phase 2 Kernel Services bootstrap.
 #[derive(Debug)]
@@ -26,6 +36,8 @@ pub struct KernelServices {
     pub allocator: FrameAllocator<4>,
     /// Pre-allocated scheduler for up to 16 concurrent tasks.
     pub scheduler: Scheduler<16>,
+    /// Pre-allocated process table for up to 16 concurrent processes.
+    pub processes: ProcessTable<16>,
     /// Initial process File Descriptor table (`stdin`, `stdout`, `stderr` + 13 slots).
     pub fd_table: vfs::FdTable<16>,
     /// In-memory `initramfs` file table holding up to 8 boot files.
@@ -47,6 +59,7 @@ impl KernelServices {
         Self {
             allocator: FrameAllocator::new(),
             scheduler: Scheduler::new(),
+            processes: ProcessTable::new(),
             fd_table: vfs::FdTable::new(),
             ramfs: vfs::RamFs::new(),
         }
@@ -74,8 +87,55 @@ impl KernelServices {
 
         let initial_rsp = stack_page_vaddr.0 + PAGE_SIZE;
         let task_id = self.scheduler.spawn_task(entry_rip, initial_rsp)?;
+        let _pid = self.processes.spawn_process(
+            Pid(0),
+            task_id,
+            AbiPersonality::LinuxPosix,
+            DEFAULT_USER_HEAP_BASE,
+        )?;
 
         Ok((vm_space, task_id))
+    }
+
+    /// Dispatches a syscall on behalf of active process `pid` with full access to process state.
+    ///
+    /// # Safety Invariants
+    /// Mutates process `brk`, `fd_table`, and lifecycle states in 100% safe Rust.
+    pub fn dispatch_process_syscall<C: UserContextApi>(&mut self, pid: Pid, ctx: &mut C) {
+        let num = ctx.syscall_num();
+        let args = ctx.syscall_args();
+
+        let personality = match self.processes.get(pid) {
+            Ok(proc_info) => proc_info.personality,
+            Err(err) => {
+                ctx.set_syscall_ret(err.to_posix_errno() as usize);
+                return;
+            }
+        };
+
+        let result = match (personality, num) {
+            (AbiPersonality::LinuxPosix, SYS_GETPID) => Ok(pid.0),
+            (AbiPersonality::LinuxPosix, SYS_BRK) => self
+                .processes
+                .get_mut(pid)
+                .map(|proc_mut| proc_mut.update_brk(args[0])),
+            (AbiPersonality::LinuxPosix, SYS_CLOSE) => self
+                .fd_table
+                .close(FileDescriptor(args[0]))
+                .map(|()| 0usize),
+            (AbiPersonality::LinuxPosix, SYS_EXIT | SYS_EXIT_GROUP) => self
+                .processes
+                .exit_process(pid, args[0] as i32)
+                .map(|()| 0usize),
+            (AbiPersonality::LinuxPosix, _) => dispatch_linux_syscall(num, args),
+            (AbiPersonality::WindowsNt, _) => dispatch_winnt_syscall(num, args),
+        };
+
+        let ret_val = match result {
+            Ok(val) => val,
+            Err(err) => err.to_posix_errno() as usize,
+        };
+        ctx.set_syscall_ret(ret_val);
     }
 
     /// Transfers bytes from a safe `VmReader` to a safe `VmWriter` using a stack buffer.
@@ -97,10 +157,12 @@ impl KernelServices {
 mod tests {
     use super::*;
     use crate::elf::{map_elf64_segments, ELF64_EHDR_SIZE, ELF64_PHDR_SIZE};
-    use crate::syscall::{dispatch_syscall, AbiPersonality, SYS_WRITE};
+    use crate::process::{
+        encode_sysv_initial_stack, AuxvEntry, ProcessState, AT_ENTRY, AT_PAGESZ,
+    };
+    use crate::syscall::{dispatch_syscall, SYS_WRITE};
     use crate::vfs::{FdEntry, InodeKind, STDERR_FD, STDIN_FD, STDOUT_FD};
     use zenith_frame::trap::UserContext;
-    use zenith_frame::UserContextApi;
 
     #[test]
     fn test_phase1_bootstrap_and_scheduler() {
@@ -154,21 +216,16 @@ mod tests {
     #[test]
     fn test_phase2_elf64_loader_and_segment_mapping() {
         let mut fake_elf = [0u8; ELF64_EHDR_SIZE + ELF64_PHDR_SIZE];
-        // Magic + ELFCLASS64 + ELFDATA2LSB
         fake_elf[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
         fake_elf[4] = 2;
         fake_elf[5] = 1;
-        // e_type = ET_EXEC (2), e_machine = EM_X86_64 (62)
         fake_elf[16..18].copy_from_slice(&2u16.to_le_bytes());
         fake_elf[18..20].copy_from_slice(&62u16.to_le_bytes());
-        // e_entry = 0x0040_1000
         fake_elf[24..32].copy_from_slice(&0x0040_1000u64.to_le_bytes());
-        // e_phoff = 64, e_phentsize = 56, e_phnum = 1
         fake_elf[32..40].copy_from_slice(&(ELF64_EHDR_SIZE as u64).to_le_bytes());
         fake_elf[54..56].copy_from_slice(&(ELF64_PHDR_SIZE as u16).to_le_bytes());
         fake_elf[56..58].copy_from_slice(&1u16.to_le_bytes());
 
-        // Program Header 0: PT_LOAD (1), PF_R | PF_X (5), vaddr = 0x0040_0000, memsz = 8192 (2 pages)
         let ph = &mut fake_elf[ELF64_EHDR_SIZE..];
         ph[0..4].copy_from_slice(&1u32.to_le_bytes());
         ph[4..8].copy_from_slice(&5u32.to_le_bytes());
@@ -219,5 +276,60 @@ mod tests {
             .expect("read from ramfs");
         assert_eq!(read_len, 16);
         assert_eq!(&out_buf, b"ELF_INIT_PAYLOAD");
+    }
+
+    #[test]
+    fn test_phase2_process_syscalls_and_sysv_stack() {
+        let mut kernel = KernelServices::new();
+        let stack_vaddr = VirtAddr(0x0000_7FFF_F000_0000);
+        let (_vm, _task) = kernel
+            .bootstrap_initial_user_task(0x0040_1000, stack_vaddr)
+            .expect("bootstrap init");
+        let init_pid = Pid(1);
+
+        // 1. Test SYS_GETPID
+        let mut ctx = UserContext::new();
+        ctx.rax = SYS_GETPID;
+        kernel.dispatch_process_syscall(init_pid, &mut ctx);
+        assert_eq!(ctx.syscall_num(), 1);
+
+        // 2. Test SYS_BRK query and expansion
+        ctx.rax = SYS_BRK;
+        ctx.rdi = 0;
+        kernel.dispatch_process_syscall(init_pid, &mut ctx);
+        assert_eq!(ctx.syscall_num(), DEFAULT_USER_HEAP_BASE.0);
+
+        let new_brk = DEFAULT_USER_HEAP_BASE.0 + PAGE_SIZE * 2;
+        ctx.rax = SYS_BRK;
+        ctx.rdi = new_brk;
+        kernel.dispatch_process_syscall(init_pid, &mut ctx);
+        assert_eq!(ctx.syscall_num(), new_brk);
+
+        // 3. Test System V AMD64 initial stack layout encoding
+        let mut stack_buf = [0u8; 128];
+        let mut writer = VmWriter::from_slice(&mut stack_buf);
+        let auxv = [
+            AuxvEntry {
+                a_type: AT_PAGESZ,
+                a_val: PAGE_SIZE as u64,
+            },
+            AuxvEntry {
+                a_type: AT_ENTRY,
+                a_val: 0x0040_1000,
+            },
+        ];
+        let bytes_written =
+            encode_sysv_initial_stack(&mut writer, 1, &auxv).expect("encode sysv stack");
+        assert_eq!(bytes_written, 72); // (3 + 3 * 2) * 8 = 72 bytes
+
+        // 4. Test SYS_EXIT transitions process to Zombie
+        ctx.rax = SYS_EXIT;
+        ctx.rdi = 42;
+        kernel.dispatch_process_syscall(init_pid, &mut ctx);
+        assert_eq!(ctx.syscall_num(), 0);
+        assert_eq!(
+            kernel.processes.get(init_pid).expect("proc 1").state,
+            ProcessState::Zombie { exit_code: 42 }
+        );
     }
 }
