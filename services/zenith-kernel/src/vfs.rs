@@ -221,7 +221,10 @@ impl<const MAX_FILES: usize> RamFs<MAX_FILES> {
         }
         let mut reader = VmReader::from_slice(&entry.data[offset..]);
         let mut scratch = [0u8; 64];
-        let to_copy = scratch.len().min(reader.remaining()).min(writer.remaining());
+        let to_copy = scratch
+            .len()
+            .min(reader.remaining())
+            .min(writer.remaining());
         let read_bytes = reader.read_bytes(&mut scratch[..to_copy])?;
         writer.write_bytes(&scratch[..read_bytes])
     }
